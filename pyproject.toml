@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tradeagent"
+version = "0.1.0"
+description = "Trading runtime with Kronos forecasts, LightGBM meta-selector, risk filters, session guard, and particle exits"
+requires-python = ">=3.11"
+dependencies = [
+  "joblib>=1.3",
+  "einops>=0.8",
+  "huggingface_hub>=0.33",
+  "lightgbm>=4.0",
+  "numpy>=2.0",
+  "pandas>=2.2",
+  "pyyaml>=6.0",
+  "requests>=2.31",
+  "safetensors>=0.6",
+  "torch>=2.0",
+  "tqdm>=4.67",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+
+[project.scripts]
+arena-bot = "arena_bot.cli:main"
+run-live = "arena_bot.cli:run_live_main"
+run-once = "arena_bot.cli:run_once_main"
+train-lightgbm = "arena_bot.cli:train_lightgbm_main"
+diagnose = "arena_bot.cli:diagnose_main"
+
+[tool.setuptools.packages.find]
+include = ["arena_bot*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

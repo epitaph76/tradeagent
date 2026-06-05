@@ -1,0 +1,26 @@
+{
+  "base_selectors": [
+    "selector_kronos_core",
+    "selector_kronos_aggressive",
+    "selector_kronos_conservative",
+    "selector_futures_view",
+    "selector_crypto_view",
+    "selector_cross_asset"
+  ],
+  "created_at_utc": "2026-06-04T07:36:40.055005+00:00",
+  "feature_names": [
+    "avg_realized_volatility",
+    "avg_spread_pct",
+    "missing_candles_total",
+    "priced_count",
+    "selected_count",
+    "signal_mean",
+    "signal_spread"
+  ],
+  "min_train_intervals": 48,
+  "rank_power": 2.0,
+  "reason": "",
+  "status": "trained",
+  "train_lookback_intervals": 512,
+  "trained_rows": 138
+}

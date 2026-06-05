@@ -1,0 +1,45 @@
+# Python/runtime noise
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+*.egg-info/
+
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# Bot runtime state and generated outputs
+logs/
+tmp*/
+data/**/logs/
+data/**/runtime-runs/
+data/**/static-smoke/
+data/**/arena_state.sqlite3
+data/**/*.sqlite
+data/**/*.sqlite3
+data/**/*.db
+data/**/*.jsonl
+data/**/*.log
+data/**/*.err.log
+data/**/*.out.log
+data/**/account_curve.csv
+data/**/trades.csv
+data/**/ranked_top.jsonl
+data/**/risk_blocked_orders.jsonl
+
+# Kronos/Hugging Face caches
+kronos/weights/**/.cache/
+kronos/model/__pycache__/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

@@ -1,0 +1,95 @@
+mode: paper
+bot_name: ArenaCompactMeta
+data_dir: data
+
+universe:
+  max_equities: 10
+
+rebalance:
+  decision_interval_minutes: 60
+
+trading_session:
+  enabled: true
+  timezone: Europe/Moscow
+  session_open: "10:00"
+  entry_start: "11:00"
+  new_entry_cutoff: "17:40"
+  kronos_cutoff: "17:40"
+  force_flat_time: "18:30"
+  session_close: "18:40"
+  flat_all_asset_classes: true
+
+portfolio:
+  max_positions: 8
+  min_abs_weight: 0.03
+  max_gross: 1.0
+  min_hold_minutes: 60
+  strong_flip_threshold: 0.85
+
+risk:
+  starting_cash: 100000
+  min_order_value_rub: 500
+  min_position_change_weight: 0.01
+  max_orders_per_rebalance: 12
+  max_new_positions_per_rebalance: 4
+  max_daily_orders: 100
+  commission_rate: 0.0005
+  slippage_spread_multiplier: 0.5
+  cash_buffer_pct: 0.02
+  sizing_safety_pct: 0.005
+  long_margin_rate: 1.0
+  short_margin_rate: 1.0
+  future_margin_rate: 1.0
+
+lightgbm:
+  model_dir: models/lightgbm_meta
+  min_train_intervals: 48
+  train_lookback_intervals: 512
+  rolling_lookback_intervals: 24
+  rank_power: 2.0
+  n_estimators: 60
+  max_model_age_hours: 36
+
+kronos:
+  enabled: true
+  code_dir: kronos/model
+  weights_dir: kronos/weights
+  model: base
+  device: auto
+  context_rows: 512
+  pred_len: 1
+  sample_count: 10
+  temperature: 0.6
+  top_p: 0.9
+  cache_enabled: true
+
+trade_lifecycle:
+  max_total_positions: 5
+  exit:
+    enabled: true
+    pred_len: 4
+    sample_count: 15
+    edge_threshold: 0.0
+    particle_enabled: true
+    particle_horizon: 8
+    particle_sample_count: 20
+    particle_min_expected_profit: 0.0015
+    particle_min_plan_probability: 0.60
+    particle_close_probability: 0.52
+    particle_ess_refresh_fraction: 0.25
+    particle_extend_min_improvement: 0.0015
+    particle_max_extensions: 1
+  entry:
+    mode: kronos_rank
+    include_held_for_topup: true
+    capital_mode: free_only
+    topup_sizing: rank_budget
+    rank_power: 2.0
+    ranking_metric: abs_edge
+
+# Non-equity instruments are supported but intentionally not guessed.
+# Add futures/crypto explicitly, for example:
+# instruments:
+#   - {secid: SBER, asset_class: equity, lot_size: 1}
+#   - {secid: YOUR_FUTURE_SECID, asset_class: future, lot_size: 1}
+#   - {secid: YOUR_CRYPTO_SECID, asset_class: crypto, lot_size: 1, quote_currency: USDT}
