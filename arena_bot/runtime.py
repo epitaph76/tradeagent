@@ -241,7 +241,8 @@ class RuntimeEngine:
             self.logger.write("selector_model_ready", {"as_of": as_of_s, **meta_payload})
         else:
             self._update_selector_returns(as_of_s, {secid: row.last_price for secid, row in snapshots.items()})
-            if _entry_mode(self.config) == "kronos_rank":
+            entry_mode = _entry_mode(self.config)
+            if entry_mode == "kronos_rank":
                 kronos_rows = tuple(self.kronos_provider.score(as_of, selected, candles))
                 signals = tuple(row for row in kronos_rows if row.signal_name == "kronos")
                 signal_scores = latest_signal_scores(signals, "kronos")
@@ -275,6 +276,42 @@ class RuntimeEngine:
                     "final_target_positions_count": len([weight for weight in target_weights.values() if abs(float(weight)) > 1e-12]),
                     "ranked_candidates_count": len(entry_diagnostics.get("ranked_candidates", [])),
                     "selected_count": int(entry_diagnostics.get("selected_count", 0) or 0),
+                }
+                self.logger.write("selector_model_ready", {"as_of": as_of_s, **meta_payload})
+            elif entry_mode == "kronos_single_top":
+                kronos_rows = tuple(self.kronos_provider.score(as_of, selected, candles))
+                signals = tuple(row for row in kronos_rows if row.signal_name == "kronos")
+                signal_scores = latest_signal_scores(signals, "kronos")
+                features = build_market_features(
+                    selected_secids=tuple(instrument.secid for instrument in selected),
+                    snapshots=snapshots,
+                    metrics=metrics,
+                    signal_scores=signal_scores,
+                )
+                self.state.save_market_features(as_of_s, features)
+                selector_weights = {"kronos_single_top": 1.0}
+                meta_payload = {
+                    "mode": "bypassed_kronos_single_top",
+                    "reason": "trade_lifecycle.entry.mode=kronos_single_top",
+                    "features": features,
+                }
+                selector_diagnostics = {}
+                target_weights, entry_diagnostics = self._build_kronos_single_top_targets(
+                    instruments=selected,
+                    positions=positions_after_risk,
+                    account=account_after_risk,
+                    prices=prices,
+                    snapshots=snapshots,
+                    metrics=metrics,
+                    signals=signals,
+                )
+                blend_diagnostics = {
+                    "mode": "bypassed_kronos_single_top",
+                    "ranking_mode": "kronos_single_top",
+                    "final_target_positions_count": len([weight for weight in target_weights.values() if abs(float(weight)) > 1e-12]),
+                    "ranked_candidates_count": len(entry_diagnostics.get("ranked_candidates", [])),
+                    "selected_count": int(entry_diagnostics.get("selected_count", 0) or 0),
+                    "target_action": entry_diagnostics.get("target_action", ""),
                 }
                 self.logger.write("selector_model_ready", {"as_of": as_of_s, **meta_payload})
             else:
@@ -321,15 +358,29 @@ class RuntimeEngine:
                 )
         target_scores = _target_scores(target_weights, signals)
         remaining_order_slots = max(int(self.config.risk.max_orders_per_rebalance) - len(exit_orders) - len(risk_cap_orders), 0)
-        entry_orders = self.order_manager.plan_entry_orders(
-            target_weights=target_weights,
-            target_scores=target_scores,
-            positions=positions_after_risk,
-            prices=prices,
-            cash=account_after_risk.cash,
-            buy_prices=buy_prices,
-            sell_prices=sell_prices,
-        )[:remaining_order_slots]
+        if _entry_mode(self.config) == "kronos_single_top":
+            entry_orders = [
+                replace(order, reason="single_top_rebalance")
+                for order in self.order_manager.plan_orders(
+                    target_weights=target_weights,
+                    target_scores=target_scores,
+                    positions=positions_after_risk,
+                    prices=prices,
+                    cash=account_after_risk.cash,
+                    buy_prices=buy_prices,
+                    sell_prices=sell_prices,
+                )
+            ][:remaining_order_slots]
+        else:
+            entry_orders = self.order_manager.plan_entry_orders(
+                target_weights=target_weights,
+                target_scores=target_scores,
+                positions=positions_after_risk,
+                prices=prices,
+                cash=account_after_risk.cash,
+                buy_prices=buy_prices,
+                sell_prices=sell_prices,
+            )[:remaining_order_slots]
         planned_candidates = list(exit_orders) + list(risk_cap_orders) + list(entry_orders)
         planned, risk_blocked_orders, projected_account_after_orders = filter_orders_no_leverage(
             cash=account_before.cash,
@@ -1521,6 +1572,150 @@ class RuntimeEngine:
             "ranked_candidates": candidates,
         }
 
+    def _build_kronos_single_top_targets(
+        self,
+        *,
+        instruments: tuple[Instrument, ...],
+        positions: Mapping[str, int],
+        account: AccountState,
+        prices: Mapping[str, float],
+        snapshots: Mapping[str, Any],
+        metrics: Mapping[str, Any],
+        signals: tuple[SignalRow, ...],
+    ) -> tuple[dict[str, float], dict[str, Any]]:
+        lifecycle = self.config.trade_lifecycle
+        entry = lifecycle.entry
+        equity = max(float(account.equity), 1.0)
+        current_weights = _position_weights(positions, prices, self.instruments_by_secid, equity)
+        active_positions = {secid: int(lots or 0) for secid, lots in positions.items() if int(lots or 0) != 0}
+        rows_by_secid = {row.secid: row for row in signals if row.signal_name == "kronos"}
+        min_net_edge = float(entry.single_top_min_net_edge)
+        max_gross_pred_return = float(entry.single_top_max_gross_pred_return)
+        target_abs_weight = _single_top_target_abs_weight(self.config, account)
+
+        ranked: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        for instrument in instruments:
+            secid = instrument.secid
+            current_lots = int(positions.get(secid, 0) or 0)
+            current_side = _position_side(current_lots)
+            pred_return = _signal_pred_return(rows_by_secid.get(secid))
+            item: dict[str, Any] = {
+                "rank": None,
+                "secid": secid,
+                "asset_class": instrument.asset_class,
+                "pred_return": pred_return,
+                "edge": None,
+                "side": None,
+                "held": current_lots != 0,
+                "selected": False,
+                "reason": "",
+                "allocated_weight": 0.0,
+                "target_weight": 0.0,
+                "same_as_current_position": False,
+                "single_top_passed_filters": False,
+            }
+            if pred_return is None:
+                item["reason"] = "missing_kronos_pred_return"
+                skipped.append(item)
+                continue
+
+            costs = _trade_cost_breakdown(secid, snapshots, metrics, self.config.risk)
+            gross_pred_return = abs(float(pred_return))
+            net_edge = gross_pred_return - costs["round_trip_cost"]
+            side = 1 if float(pred_return) > 0 else (-1 if float(pred_return) < 0 else 0)
+            item.update(
+                {
+                    "pred_return": float(pred_return),
+                    "edge": net_edge,
+                    "gross_pred_return": gross_pred_return,
+                    "net_edge": net_edge,
+                    "side": "long" if side > 0 else ("short" if side < 0 else None),
+                    **costs,
+                }
+            )
+            if side == 0:
+                item["reason"] = "zero_pred_return"
+                skipped.append(item)
+                continue
+            item["same_as_current_position"] = current_side == side and current_lots != 0
+            filter_reason = _single_top_filter_reason(
+                gross_pred_return=gross_pred_return,
+                net_edge=net_edge,
+                min_net_edge=min_net_edge,
+                max_gross_pred_return=max_gross_pred_return,
+            )
+            item["single_top_passed_filters"] = filter_reason == ""
+            item["filter_reason"] = filter_reason
+            ranked.append(item)
+
+        ranked.sort(key=lambda item: (-float(item["gross_pred_return"]), str(item["secid"])))
+        for rank, item in enumerate(ranked, start=1):
+            item["rank"] = rank
+            if rank > 1:
+                item["reason"] = "not_top_1"
+
+        target_weights: dict[str, float] = {}
+        top = ranked[0] if ranked else None
+        top1_secid = str(top["secid"]) if top else ""
+        top1_side = str(top["side"]) if top and top.get("side") else ""
+        top1_passed = bool(top and top.get("single_top_passed_filters"))
+        target_action = "close_to_cash" if active_positions else "skip_flat"
+        action_reason = "missing_kronos_pred_return"
+        selected_count = 0
+
+        if top is not None:
+            filter_reason = str(top.get("filter_reason") or "")
+            if filter_reason:
+                top["reason"] = filter_reason
+                action_reason = "single_top_close_to_cash" if active_positions else filter_reason
+            elif target_abs_weight <= 0:
+                top["reason"] = "single_top_no_target_weight"
+                action_reason = "single_top_no_target_weight"
+            else:
+                top["selected"] = True
+                selected_count = 1
+                side_value = 1.0 if top["side"] == "long" else -1.0
+                same_current = bool(top.get("same_as_current_position")) and len(active_positions) == 1 and top1_secid in active_positions
+                if same_current:
+                    target_weights = dict(current_weights)
+                    target_action = "hold_same"
+                    top["reason"] = "same_top_hold"
+                    action_reason = "same_top_hold"
+                    top["allocated_weight"] = abs(float(current_weights.get(top1_secid, 0.0) or 0.0))
+                    top["target_weight"] = float(current_weights.get(top1_secid, 0.0) or 0.0)
+                else:
+                    target_weight = side_value * target_abs_weight
+                    target_weights = {top1_secid: target_weight}
+                    target_action = "switch" if active_positions else "open"
+                    top["reason"] = "single_top_entry"
+                    action_reason = "single_top_entry"
+                    top["allocated_weight"] = target_abs_weight
+                    top["target_weight"] = target_weight
+
+        candidates = ranked + sorted(skipped, key=lambda item: str(item["secid"]))
+        return target_weights, {
+            "ranking_mode": "kronos_single_top",
+            "ranking_metric": "gross_pred_return",
+            "max_total_positions": int(lifecycle.max_total_positions),
+            "held_count": len(active_positions),
+            "gross_after_exit": float(account.gross),
+            "margin_used_after_exit": float(account.margin_used),
+            "free_capital": _entry_free_value(account, self.config.risk),
+            "free_weight": _entry_free_value(account, self.config.risk) / equity if equity > 0 else 0.0,
+            "single_top_min_net_edge": min_net_edge,
+            "single_top_max_gross_pred_return": max_gross_pred_return,
+            "single_top_target_weight": float(entry.single_top_target_weight),
+            "target_abs_weight": target_abs_weight,
+            "selected_count": selected_count,
+            "top1_secid": top1_secid,
+            "top1_side": top1_side,
+            "top1_passed_filters": top1_passed,
+            "target_action": target_action,
+            "action_reason": action_reason,
+            "ranked_candidates": candidates,
+        }
+
     def _mark_kronos_rank_candidate_selection(
         self,
         *,
@@ -1964,6 +2159,32 @@ def _position_weights(
 def _entry_free_value(account: AccountState, risk: Any) -> float:
     safety = min(max(float(getattr(risk, "sizing_safety_pct", 0.0) or 0.0), 0.0), 0.95)
     return max(min(float(account.available_gross), float(account.available_cash)) * (1.0 - safety), 0.0)
+
+
+def _single_top_target_abs_weight(config: RuntimeConfig, account: AccountState) -> float:
+    if float(account.equity) <= 0:
+        return 0.0
+    entry = config.trade_lifecycle.entry
+    configured = min(max(float(entry.single_top_target_weight), 0.0), 10.0)
+    max_gross = max(float(config.portfolio.max_gross), 0.0)
+    cash_buffer = min(max(float(config.risk.cash_buffer_pct), 0.0), 0.95)
+    safety = min(max(float(config.risk.sizing_safety_pct), 0.0), 0.95)
+    buffered_full_capital = max(1.0 - cash_buffer, 0.0) * (1.0 - safety)
+    return max(min(configured, max_gross, buffered_full_capital), 0.0)
+
+
+def _single_top_filter_reason(
+    *,
+    gross_pred_return: float,
+    net_edge: float,
+    min_net_edge: float,
+    max_gross_pred_return: float,
+) -> str:
+    if float(gross_pred_return) > float(max_gross_pred_return):
+        return "single_top_gross_pred_return_cap"
+    if float(net_edge) < float(min_net_edge):
+        return "single_top_net_edge_below_min"
+    return ""
 
 
 def _position_side(lots: int) -> int:

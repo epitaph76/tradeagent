@@ -157,6 +157,9 @@ class TradeLifecycleEntryConfig:
     topup_sizing: str = "rank_budget"
     rank_power: float = 2.0
     ranking_metric: str = "abs_edge"
+    single_top_min_net_edge: float = 0.0015
+    single_top_max_gross_pred_return: float = 0.0075
+    single_top_target_weight: float = 1.0
 
 
 @dataclass(frozen=True)

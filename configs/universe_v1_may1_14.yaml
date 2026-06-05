@@ -30,8 +30,8 @@ risk:
   starting_cash: 100000
   min_order_value_rub: 500
   min_position_change_weight: 0.01
-  max_orders_per_rebalance: 14
-  max_new_positions_per_rebalance: 6
+  max_orders_per_rebalance: 4
+  max_new_positions_per_rebalance: 1
   max_daily_orders: 100
   commission_rate: 0.0005
   slippage_spread_multiplier: 0.5
@@ -64,13 +64,13 @@ kronos:
   cache_enabled: true
 
 trade_lifecycle:
-  max_total_positions: 5
+  max_total_positions: 1
   exit:
-    enabled: true
+    enabled: false
     pred_len: 4
     sample_count: 15
     edge_threshold: 0.0
-    particle_enabled: true
+    particle_enabled: false
     particle_horizon: 8
     particle_sample_count: 20
     particle_min_expected_profit: 0.0015
@@ -80,12 +80,15 @@ trade_lifecycle:
     particle_extend_min_improvement: 0.0015
     particle_max_extensions: 1
   entry:
-    mode: kronos_rank
+    mode: kronos_single_top
     include_held_for_topup: true
     capital_mode: free_only
     topup_sizing: rank_budget
     rank_power: 2.0
     ranking_metric: abs_edge
+    single_top_min_net_edge: 0.0015
+    single_top_max_gross_pred_return: 0.0075
+    single_top_target_weight: 1.0
 
 instruments:
   - secid: VTBR

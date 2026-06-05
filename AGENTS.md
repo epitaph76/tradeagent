@@ -13,7 +13,7 @@ Tradeagent is a compact paper/live trading runtime for a 20-instrument universe.
 - A LightGBM meta-selector path that is still present and tested.
 - Saved-candle runtime backtests for the May 1-14 dataset.
 
-The current implemented entry mode in the main config is `kronos_rank`. Ideas discussed later, such as `kronos_single_top` or rebound-only entry, are not implemented unless you add them explicitly.
+The main May 1-14 config currently runs the experimental `kronos_single_top` mode. `kronos_rank` remains implemented and covered by tests, and `configs/default.yaml` keeps that more conservative mode.
 
 ## Repository Map
 
@@ -48,7 +48,30 @@ The current implemented entry mode in the main config is `kronos_rank`. Ideas di
 
 ## Entry Logic
 
-Current main config uses:
+The May 1-14 experiment config uses:
+
+```yaml
+trade_lifecycle:
+  max_total_positions: 1
+  exit:
+    enabled: false
+  entry:
+    mode: kronos_single_top
+```
+
+`kronos_single_top` behavior:
+
+- Calls Kronos `score()` for the full selected universe each trading hour.
+- Ranks candidates by `gross_pred_return = abs(pred_return)`.
+- Takes rank-1 only; no lower-ranked replacement is backfilled.
+- Computes spread, commission, slippage, round-trip cost, and `net_edge`.
+- Enters only if `net_edge >= single_top_min_net_edge` and `gross_pred_return <= single_top_max_gross_pred_return`.
+- Targets near full capital using `cash_buffer_pct` and `sizing_safety_pct`.
+- If the current position is the same `secid` and same side as rank-1, it holds without close/reopen.
+- If rank-1 changes, flips side, or fails filters, rebalance orders close the old position; a passing new rank-1 is opened immediately.
+- `entry_diagnostics.ranked_candidates` is always populated when Kronos entry is allowed, so `runtime_backtest.py` writes hourly `ranked_top.jsonl` rows.
+
+`configs/default.yaml` and tests still cover:
 
 ```yaml
 trade_lifecycle:
@@ -140,4 +163,4 @@ python -m arena_bot.cli train-lightgbm --config configs/universe_v1_may1_14.yaml
 
 ## Known Strategy Direction
 
-Recent analysis showed `kronos_rank` is a weak but nonzero directional signal, not a calibrated high-confidence ranker. Future work may move entry toward fewer trades, single-top allocation, or rebound-only setups, but those are design directions, not current behavior.
+Recent analysis showed `kronos_rank` is a weak but nonzero directional signal, not a calibrated high-confidence ranker. The current active experiment is fewer trades via `kronos_single_top`; a rebound-only detector is still a design direction, not implemented behavior.

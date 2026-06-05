@@ -557,6 +557,185 @@ def test_kronos_rank_slippage_multiplier_tightens_cost_filter(tmp_path: Path):
     assert strict_row["round_trip_cost"] > loose_row["round_trip_cost"]
 
 
+def test_kronos_single_top_opens_only_rank_one_when_filters_pass(tmp_path: Path):
+    instruments = (Instrument("TOP"), Instrument("SECOND"))
+    engine = _engine(
+        tmp_path,
+        mode="paper",
+        scores={},
+        forecast_returns={"TOP": 0.006, "SECOND": -0.005},
+        instruments=instruments,
+        entry_mode="kronos_single_top",
+        exit_enabled=False,
+        portfolio_max_positions=1,
+    )
+
+    result = engine.run_once(datetime(2026, 6, 3, 12, 0))
+    payload = _decision_payload(engine, result.decision_id)
+    by_secid = {row["secid"]: row for row in payload["entry_ranked_candidates"]}
+
+    assert len(result.orders) == 1
+    assert result.orders[0].secid == "TOP"
+    assert result.orders[0].direction == "B"
+    assert result.orders[0].request["reason"] == "single_top_rebalance"
+    assert by_secid["TOP"]["selected"] is True
+    assert by_secid["TOP"]["reason"] == "single_top_entry"
+    assert by_secid["TOP"]["target_weight"] > 0.9
+    assert by_secid["SECOND"]["selected"] is False
+    assert by_secid["SECOND"]["reason"] == "not_top_1"
+    assert payload["entry_diagnostics"]["ranking_mode"] == "kronos_single_top"
+    assert payload["entry_diagnostics"]["target_action"] == "open"
+
+
+def test_kronos_single_top_does_not_backfill_rank_two_when_top_fails(tmp_path: Path):
+    instruments = (Instrument("OVERCONFIDENT"), Instrument("VALID"))
+    engine = _engine(
+        tmp_path,
+        mode="paper",
+        scores={},
+        forecast_returns={"OVERCONFIDENT": 0.009, "VALID": 0.006},
+        instruments=instruments,
+        entry_mode="kronos_single_top",
+        exit_enabled=False,
+        portfolio_max_positions=1,
+    )
+
+    result = engine.run_once(datetime(2026, 6, 3, 12, 0))
+    payload = _decision_payload(engine, result.decision_id)
+    by_secid = {row["secid"]: row for row in payload["entry_ranked_candidates"]}
+
+    assert not result.orders
+    assert by_secid["OVERCONFIDENT"]["rank"] == 1
+    assert by_secid["OVERCONFIDENT"]["reason"] == "single_top_gross_pred_return_cap"
+    assert by_secid["OVERCONFIDENT"]["selected"] is False
+    assert by_secid["VALID"]["rank"] == 2
+    assert by_secid["VALID"]["reason"] == "not_top_1"
+    assert payload["entry_diagnostics"]["target_action"] == "skip_flat"
+    assert payload["entry_diagnostics"]["selected_count"] == 0
+
+
+def test_kronos_single_top_holds_same_instrument_and_side(tmp_path: Path):
+    as_of = datetime(2026, 6, 3, 12, 0)
+    instruments = (Instrument("TOP"), Instrument("SECOND"))
+    engine = _engine(
+        tmp_path,
+        mode="paper",
+        scores={},
+        forecast_returns={"TOP": 0.006, "SECOND": 0.005},
+        instruments=instruments,
+        entry_mode="kronos_single_top",
+        exit_enabled=False,
+        portfolio_max_positions=1,
+    )
+    engine.state.upsert_paper_position("TOP", 10, 0.01, (as_of - timedelta(hours=1)).isoformat(timespec="seconds"))
+
+    result = engine.run_once(as_of)
+    payload = _decision_payload(engine, result.decision_id)
+    by_secid = {row["secid"]: row for row in payload["entry_ranked_candidates"]}
+
+    assert not result.orders
+    assert by_secid["TOP"]["reason"] == "same_top_hold"
+    assert by_secid["TOP"]["same_as_current_position"] is True
+    assert payload["entry_diagnostics"]["target_action"] == "hold_same"
+
+
+def test_kronos_single_top_switches_when_top_changes(tmp_path: Path):
+    as_of = datetime(2026, 6, 3, 12, 0)
+    instruments = (Instrument("OLD"), Instrument("NEW"))
+    engine = _engine(
+        tmp_path,
+        mode="paper",
+        scores={},
+        forecast_returns={"OLD": 0.005, "NEW": 0.006},
+        instruments=instruments,
+        entry_mode="kronos_single_top",
+        exit_enabled=False,
+        portfolio_max_positions=1,
+    )
+    engine.state.upsert_paper_position("OLD", 10, 0.01, (as_of - timedelta(hours=1)).isoformat(timespec="seconds"))
+
+    result = engine.run_once(as_of)
+    payload = _decision_payload(engine, result.decision_id)
+    by_order = {(order.secid, order.direction): order for order in result.orders}
+
+    assert ("OLD", "S") in by_order
+    assert ("NEW", "B") in by_order
+    assert all(order.request["reason"] == "single_top_rebalance" for order in result.orders)
+    assert payload["entry_diagnostics"]["target_action"] == "switch"
+
+
+def test_kronos_single_top_closes_to_cash_when_top_fails_filters(tmp_path: Path):
+    as_of = datetime(2026, 6, 3, 12, 0)
+    instruments = (Instrument("OLD"), Instrument("OVERCONFIDENT"))
+    engine = _engine(
+        tmp_path,
+        mode="paper",
+        scores={},
+        forecast_returns={"OLD": 0.005, "OVERCONFIDENT": 0.009},
+        instruments=instruments,
+        entry_mode="kronos_single_top",
+        exit_enabled=False,
+        portfolio_max_positions=1,
+    )
+    engine.state.upsert_paper_position("OLD", 10, 0.01, (as_of - timedelta(hours=1)).isoformat(timespec="seconds"))
+
+    result = engine.run_once(as_of)
+    payload = _decision_payload(engine, result.decision_id)
+    by_secid = {row["secid"]: row for row in payload["entry_ranked_candidates"]}
+
+    assert len(result.orders) == 1
+    assert result.orders[0].secid == "OLD"
+    assert result.orders[0].direction == "S"
+    assert result.orders[0].request["reason"] == "single_top_rebalance"
+    assert by_secid["OVERCONFIDENT"]["reason"] == "single_top_gross_pred_return_cap"
+    assert payload["entry_diagnostics"]["target_action"] == "close_to_cash"
+    assert payload["entry_diagnostics"]["action_reason"] == "single_top_close_to_cash"
+
+
+def test_kronos_single_top_gross_cap_blocks_overconfident_signal(tmp_path: Path):
+    engine = _engine(
+        tmp_path,
+        mode="paper",
+        scores={},
+        forecast_returns={"SBER": 0.008},
+        entry_mode="kronos_single_top",
+        exit_enabled=False,
+        portfolio_max_positions=1,
+    )
+
+    result = engine.run_once(datetime(2026, 6, 3, 12, 0))
+    payload = _decision_payload(engine, result.decision_id)
+    row = payload["entry_ranked_candidates"][0]
+
+    assert not result.orders
+    assert row["reason"] == "single_top_gross_pred_return_cap"
+    assert row["single_top_passed_filters"] is False
+    assert payload["entry_diagnostics"]["top1_passed_filters"] is False
+
+
+def test_kronos_single_top_keeps_ranked_candidates_when_no_order(tmp_path: Path):
+    engine = _engine(
+        tmp_path,
+        mode="paper",
+        scores={},
+        forecast_returns={"SBER": 0.003},
+        entry_mode="kronos_single_top",
+        exit_enabled=False,
+        portfolio_max_positions=1,
+    )
+
+    result = engine.run_once(datetime(2026, 6, 3, 12, 0))
+    payload = _decision_payload(engine, result.decision_id)
+    row = payload["entry_ranked_candidates"][0]
+
+    assert not result.orders
+    assert row["secid"] == "SBER"
+    assert row["selected"] is False
+    assert row["reason"] == "single_top_net_edge_below_min"
+    assert row["target_weight"] == 0.0
+    assert payload["entry_diagnostics"]["ranked_candidates"]
+
+
 def test_kronos_rank_with_zero_held_opens_at_most_five_positions(tmp_path: Path):
     instruments = tuple(Instrument(f"T{i:02d}") for i in range(7))
     returns = {instrument.secid: 0.03 - idx * 0.001 for idx, instrument in enumerate(instruments)}
@@ -988,6 +1167,7 @@ def _engine(
     selector_max_positions: int = 2,
     portfolio_max_positions: int = 2,
     entry_mode: str = "selectors",
+    exit_enabled: bool = True,
     slippage_spread_multiplier: float = 0.5,
     spread_pct_by_secid: dict[str, float] | None = None,
     exit_provider=None,
@@ -995,6 +1175,9 @@ def _engine(
     particle_horizon: int = 8,
     particle_sample_count: int = 20,
     particle_ess_refresh_fraction: float = 0.25,
+    single_top_min_net_edge: float = 0.0015,
+    single_top_max_gross_pred_return: float = 0.0075,
+    single_top_target_weight: float = 1.0,
     candles_by_secid: dict[str, pd.DataFrame] | None = None,
     trading_session: TradingSessionConfig | None = None,
     kronos_provider=None,
@@ -1031,12 +1214,18 @@ def _engine(
         trading_session=trading_session or TradingSessionConfig(enabled=False),
         trade_lifecycle=TradeLifecycleConfig(
             exit=TradeLifecycleExitConfig(
+                enabled=exit_enabled,
                 particle_enabled=particle_exit_enabled,
                 particle_horizon=particle_horizon,
                 particle_sample_count=particle_sample_count,
                 particle_ess_refresh_fraction=particle_ess_refresh_fraction,
             ),
-            entry=TradeLifecycleEntryConfig(mode=entry_mode),
+            entry=TradeLifecycleEntryConfig(
+                mode=entry_mode,
+                single_top_min_net_edge=single_top_min_net_edge,
+                single_top_max_gross_pred_return=single_top_max_gross_pred_return,
+                single_top_target_weight=single_top_target_weight,
+            ),
         ),
     )
     spreads = dict(spread_pct_by_secid or {})

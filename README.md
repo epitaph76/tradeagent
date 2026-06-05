@@ -7,12 +7,11 @@ For coding agents, start with [AGENTS.md](AGENTS.md). It explains the current ar
 ## What Is Implemented
 
 - `kronos_rank` entry mode: Kronos ranks candidates, then the runtime applies strict round-trip cost filtering.
+- `kronos_single_top` entry mode: hourly full-capital experiment that ranks the universe, trades only rank-1 if strict filters pass, and closes/switches through rebalance orders.
 - Particle exit tracking: open positions can be accompanied by Kronos sample paths and weighted exit planning.
 - Session-safe trading: v1 uses a single `Europe/Moscow` window and forces all assets cash-flat near session close.
 - LightGBM meta-selector support: model loading/training code and latest compact model are kept in the repo.
 - Saved-candle backtests: the current May 1-14 dataset is included for reproducible runtime checks.
-
-Strategy ideas such as rebound-only entry or single-top hourly allocation are not implemented yet.
 
 ## Layout
 

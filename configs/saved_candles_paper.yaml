@@ -86,6 +86,9 @@ trade_lifecycle:
     topup_sizing: rank_budget
     rank_power: 2.0
     ranking_metric: abs_edge
+    single_top_min_net_edge: 0.0015
+    single_top_max_gross_pred_return: 0.0075
+    single_top_target_weight: 1.0
 
 market_data:
   saved_candles:
