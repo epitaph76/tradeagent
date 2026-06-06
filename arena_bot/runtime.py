@@ -72,6 +72,8 @@ class RuntimeEngine:
         lifecycle = self.config.trade_lifecycle
         if not self.config.kronos.enabled or not lifecycle.exit.enabled:
             return EmptyKronosSignalProvider()
+        if not bool(getattr(lifecycle.exit, "edge_enabled", True)) and not bool(getattr(lifecycle.exit, "particle_enabled", False)):
+            return EmptyKronosSignalProvider()
         return RealKronosSignalProvider(
             config=replace(
                 self.config.kronos,
@@ -181,7 +183,9 @@ class RuntimeEngine:
         signals: tuple[SignalRow, ...] = tuple()
         universe_diagnostics: dict[str, Any] = {}
         entry_block_reason = ""
+        entry_rebalance_diagnostics: dict[str, Any] = {}
         horizon_diagnostics: dict[str, Any] = {}
+        entry_recheck_diagnostics: dict[str, Any] = {}
         selected: tuple[Instrument, ...] = tuple()
         if not bool(session.get("entry_allowed", True)):
             entry_block_reason = str(session.get("action_reason") or "session_entry_cutoff")
@@ -206,6 +210,21 @@ class RuntimeEngine:
             )
             if not horizon_ok:
                 entry_block_reason = "session_kronos_horizon_exceeds_close"
+            else:
+                recheck_ok, entry_recheck_diagnostics = _entry_recheck_window_check(
+                    as_of=as_of,
+                    decision_interval_minutes=int(self.config.rebalance.decision_interval_minutes),
+                    max_target_time=_entry_recheck_deadline(session),
+                )
+                if not recheck_ok:
+                    entry_block_reason = "session_kronos_recheck_window_too_short"
+                else:
+                    rebalance_ok, entry_rebalance_diagnostics = _entry_rebalance_tick_check(
+                        session=session,
+                        decision_interval_minutes=int(self.config.rebalance.decision_interval_minutes),
+                    )
+                    if not rebalance_ok:
+                        entry_block_reason = "entry_rebalance_wait"
 
         if entry_block_reason:
             target_weights = _position_weights(positions_after_risk, prices, self.instruments_by_secid, max(float(account_after_risk.equity), 1.0))
@@ -225,6 +244,10 @@ class RuntimeEngine:
             }
             if horizon_diagnostics:
                 meta_payload["kronos_horizon"] = horizon_diagnostics
+            if entry_recheck_diagnostics:
+                meta_payload["entry_recheck_window"] = entry_recheck_diagnostics
+            if entry_rebalance_diagnostics:
+                meta_payload["entry_rebalance_tick"] = entry_rebalance_diagnostics
             entry_diagnostics = {
                 "status": "blocked",
                 "reason": entry_block_reason,
@@ -233,6 +256,10 @@ class RuntimeEngine:
             }
             if horizon_diagnostics:
                 entry_diagnostics["kronos_horizon"] = horizon_diagnostics
+            if entry_recheck_diagnostics:
+                entry_diagnostics["entry_recheck_window"] = entry_recheck_diagnostics
+            if entry_rebalance_diagnostics:
+                entry_diagnostics["entry_rebalance_tick"] = entry_rebalance_diagnostics
             blend_diagnostics = {
                 "mode": "session_guard",
                 "reason": entry_block_reason,
@@ -304,6 +331,7 @@ class RuntimeEngine:
                     snapshots=snapshots,
                     metrics=metrics,
                     signals=signals,
+                    blocked_secids=exit_close_secids,
                 )
                 blend_diagnostics = {
                     "mode": "bypassed_kronos_single_top",
@@ -403,6 +431,11 @@ class RuntimeEngine:
             risk=self.config.risk,
             max_gross=self.config.portfolio.max_gross,
         )
+        giveback_state_sync = self._sync_giveback_state_after_orders(
+            as_of=as_of,
+            planned=planned,
+            orders=orders,
+        )
         particle_tracker_sync = self._sync_particle_trackers_after_orders(
             as_of=as_of,
             planned=planned,
@@ -450,6 +483,7 @@ class RuntimeEngine:
             "free_capital_after_exit": free_capital_after_exit,
             "held_positions_after_exit": positions_after_exit,
             "held_positions_after_risk": positions_after_risk,
+            "giveback_state_sync": giveback_state_sync,
             "particle_tracker_sync": particle_tracker_sync,
             "entry_ranked_candidates": entry_diagnostics.get("ranked_candidates", []),
             "orders": [asdict(order) for order in orders],
@@ -630,6 +664,11 @@ class RuntimeEngine:
             risk=self.config.risk,
             max_gross=self.config.portfolio.max_gross,
         )
+        giveback_state_sync = self._sync_giveback_state_after_orders(
+            as_of=as_of,
+            planned=planned,
+            orders=orders,
+        )
         particle_tracker_sync = self._sync_particle_trackers_after_orders(
             as_of=as_of,
             planned=planned,
@@ -692,6 +731,7 @@ class RuntimeEngine:
             "free_capital_after_exit": float(account_after_exit.available_gross),
             "held_positions_after_exit": positions_after_exit,
             "held_positions_after_risk": positions_after_exit,
+            "giveback_state_sync": giveback_state_sync,
             "particle_tracker_sync": particle_tracker_sync,
             "entry_ranked_candidates": [],
             "orders": [asdict(order) for order in orders],
@@ -758,10 +798,31 @@ class RuntimeEngine:
             diagnostics["status"] = "session_blocked"
             diagnostics["held"] = {instrument.secid: {"action": "hold", "action_reason": reason} for instrument in held}
             return diagnostics, {}
-        if bool(getattr(lifecycle.exit, "particle_enabled", False)):
-            return self._build_particle_exit_plan(
+
+        scores: dict[str, float] = {}
+        close_secids: list[str] = []
+        remaining_held = list(held)
+        if bool(getattr(lifecycle.exit, "giveback_enabled", False)):
+            giveback_scores, giveback_close_secids = self._build_giveback_exit_plan(
                 as_of=as_of,
                 held=held,
+                positions=positions,
+                snapshots=snapshots,
+                candles=candles,
+                diagnostics=diagnostics,
+            )
+            scores.update(giveback_scores)
+            close_secids.extend(giveback_close_secids)
+            closed = set(giveback_close_secids)
+            remaining_held = [instrument for instrument in held if instrument.secid not in closed]
+            diagnostics["close_secids"] = list(close_secids)
+        if not remaining_held:
+            diagnostics["status"] = "ready"
+            return diagnostics, scores
+        if bool(getattr(lifecycle.exit, "particle_enabled", False)):
+            particle_diagnostics, particle_scores = self._build_particle_exit_plan(
+                as_of=as_of,
+                held=remaining_held,
                 positions=positions,
                 snapshots=snapshots,
                 metrics=metrics,
@@ -769,17 +830,31 @@ class RuntimeEngine:
                 diagnostics=diagnostics,
                 session=session,
             )
+            return particle_diagnostics, {**scores, **particle_scores}
+        if not bool(getattr(lifecycle.exit, "edge_enabled", True)):
+            for instrument in remaining_held:
+                diagnostics["held"].setdefault(
+                    instrument.secid,
+                    {
+                        "action": "hold",
+                        "action_reason": "exit_rules_disabled",
+                        "giveback_enabled": bool(getattr(lifecycle.exit, "giveback_enabled", False)),
+                    },
+                )
+            diagnostics["close_secids"] = close_secids
+            diagnostics["status"] = "ready"
+            return diagnostics, scores
         if session is not None and not bool(session.get("kronos_allowed", True)):
             reason = str(session.get("action_reason") or "session_kronos_blocked")
             diagnostics["status"] = "session_kronos_blocked"
-            diagnostics["held"] = {instrument.secid: {"action": "hold", "action_reason": reason} for instrument in held}
-            return diagnostics, {}
+            for instrument in remaining_held:
+                diagnostics["held"].setdefault(instrument.secid, {"action": "hold", "action_reason": reason})
+            diagnostics["close_secids"] = close_secids
+            return diagnostics, scores
 
-        rows = tuple(self.exit_kronos_provider.score(as_of, held, candles))
+        rows = tuple(self.exit_kronos_provider.score(as_of, remaining_held, candles))
         by_secid = {row.secid: row for row in rows if row.signal_name == "kronos"}
-        scores: dict[str, float] = {}
-        close_secids: list[str] = []
-        for instrument in held:
+        for instrument in remaining_held:
             secid = instrument.secid
             row = by_secid.get(secid)
             pred_return = _signal_pred_return(row)
@@ -811,6 +886,99 @@ class RuntimeEngine:
         diagnostics["status"] = "ready"
         return diagnostics, scores
 
+    def _build_giveback_exit_plan(
+        self,
+        *,
+        as_of: datetime,
+        held: tuple[Instrument, ...] | list[Instrument],
+        positions: Mapping[str, int],
+        snapshots: Mapping[str, Any],
+        candles: Mapping[str, Any],
+        diagnostics: dict[str, Any],
+    ) -> tuple[dict[str, float], list[str]]:
+        lifecycle = self.config.trade_lifecycle
+        min_arm_profit = _non_negative_float(getattr(lifecycle.exit, "giveback_min_arm_profit", 0.012), default=0.012)
+        ratio_threshold = _non_negative_float(getattr(lifecycle.exit, "giveback_ratio", 0.60), default=0.60)
+        held_secids = {instrument.secid for instrument in held}
+        for secid in set(self.state.load_position_giveback_states()) - held_secids:
+            self.state.delete_position_giveback_state(secid)
+
+        stored_positions = self.state.load_paper_positions()
+        scores: dict[str, float] = {}
+        close_secids: list[str] = []
+        as_of_s = as_of.isoformat(timespec="seconds")
+        for instrument in held:
+            secid = instrument.secid
+            lots = int(positions.get(secid, 0) or 0)
+            side = _tracker_side_for_lots(lots)
+            if side is None:
+                self.state.delete_position_giveback_state(secid)
+                continue
+
+            current_price = _current_close(secid, snapshots, candles, {})
+            if current_price <= 0:
+                diagnostics["held"][secid] = {
+                    "action": "hold",
+                    "action_reason": "giveback_current_price_missing",
+                    "side": side,
+                    "giveback_enabled": True,
+                }
+                continue
+
+            state = self.state.load_position_giveback_state(secid)
+            entry_price = _finite_float((state or {}).get("entry_price", 0.0), default=0.0)
+            state_side = str((state or {}).get("side") or "")
+            state_bootstrapped = state is None or state_side != side or entry_price <= 0
+            if state_bootstrapped:
+                entry_price = current_price
+                previous_mfe = 0.0
+                current_pnl = 0.0
+                opened_at = str(stored_positions.get(secid, {}).get("opened_at") or as_of_s)
+            else:
+                previous_mfe = max(_finite_float(state.get("mfe_pct", 0.0), default=0.0), 0.0)
+                current_pnl = _side_value(side) * (current_price / entry_price - 1.0)
+                opened_at = str(state.get("opened_at") or stored_positions.get(secid, {}).get("opened_at") or as_of_s)
+
+            mfe_pct = max(previous_mfe, current_pnl, 0.0)
+            giveback_pct = max(mfe_pct - current_pnl, 0.0) if mfe_pct > 0 else 0.0
+            giveback_ratio = giveback_pct / mfe_pct if mfe_pct > 0 else 0.0
+            armed = mfe_pct >= min_arm_profit
+            close = bool(armed and giveback_ratio >= ratio_threshold)
+            action_reason = "giveback_trailing" if close else ("giveback_armed_hold" if armed else "giveback_not_armed")
+
+            self.state.save_position_giveback_state(
+                secid=secid,
+                side=side,
+                entry_price=entry_price,
+                mfe_pct=mfe_pct,
+                last_pnl_pct=current_pnl,
+                opened_at=opened_at,
+                updated_at=as_of_s,
+            )
+            if close:
+                close_secids.append(secid)
+            scores[secid] = giveback_ratio if close else max(mfe_pct, giveback_ratio)
+            diagnostics["held"][secid] = {
+                "action": "close" if close else "hold",
+                "action_reason": action_reason,
+                "side": side,
+                "giveback_enabled": True,
+                "state_bootstrapped": state_bootstrapped,
+                "entry_price": entry_price,
+                "current_price": current_price,
+                "current_pnl_pct": current_pnl,
+                "previous_mfe_pct": previous_mfe,
+                "mfe_pct": mfe_pct,
+                "giveback_pct": giveback_pct,
+                "giveback_ratio": giveback_ratio,
+                "giveback_min_arm_profit": min_arm_profit,
+                "giveback_ratio_threshold": ratio_threshold,
+                "giveback_armed": armed,
+                "opened_at": opened_at,
+                "updated_at": as_of_s,
+            }
+        return scores, close_secids
+
     def _build_particle_exit_plan(
         self,
         *,
@@ -833,7 +1001,7 @@ class RuntimeEngine:
             self.state.delete_kronos_exit_tracker(secid)
 
         scores: dict[str, float] = {}
-        close_secids: list[str] = []
+        close_secids: list[str] = list(diagnostics.get("close_secids", []))
         for instrument in held:
             secid = instrument.secid
             lots = int(positions.get(secid, 0) or 0)
@@ -1234,6 +1402,53 @@ class RuntimeEngine:
             state=dict(tracker.get("state") or {}),
         )
 
+    def _sync_giveback_state_after_orders(
+        self,
+        *,
+        as_of: datetime,
+        planned: list[Any],
+        orders: tuple[Any, ...],
+    ) -> dict[str, Any]:
+        if self.config.live_orders:
+            return {"enabled": bool(getattr(self.config.trade_lifecycle.exit, "giveback_enabled", False)), "status": "live_skipped"}
+        as_of_s = as_of.isoformat(timespec="seconds")
+        opened_or_reset: list[str] = []
+        deleted: list[str] = []
+        kept: list[str] = []
+        giveback_enabled = bool(getattr(self.config.trade_lifecycle.exit, "giveback_enabled", False))
+        for order, result in zip(planned, orders):
+            if result.status not in {"dry_run", "submitted"}:
+                continue
+            side_before = _tracker_side_for_lots(int(getattr(order, "current_lots", 0) or 0))
+            side_after = _tracker_side_for_lots(int(getattr(order, "target_lots", 0) or 0))
+            if side_after is None:
+                self.state.delete_position_giveback_state(order.secid)
+                deleted.append(order.secid)
+                continue
+            if not giveback_enabled:
+                continue
+            existing = self.state.load_position_giveback_state(order.secid)
+            if side_before != side_after or existing is None:
+                self.state.save_position_giveback_state(
+                    secid=order.secid,
+                    side=side_after,
+                    entry_price=float(getattr(order, "price", 0.0) or 0.0),
+                    mfe_pct=0.0,
+                    last_pnl_pct=0.0,
+                    opened_at=as_of_s,
+                    updated_at=as_of_s,
+                )
+                opened_or_reset.append(order.secid)
+            else:
+                kept.append(order.secid)
+        return {
+            "enabled": giveback_enabled,
+            "status": "ready",
+            "opened_or_reset": sorted(set(opened_or_reset)),
+            "deleted": sorted(set(deleted)),
+            "kept": sorted(set(kept)),
+        }
+
     def _sync_particle_trackers_after_orders(
         self,
         *,
@@ -1582,14 +1797,17 @@ class RuntimeEngine:
         snapshots: Mapping[str, Any],
         metrics: Mapping[str, Any],
         signals: tuple[SignalRow, ...],
+        blocked_secids: set[str] | None = None,
     ) -> tuple[dict[str, float], dict[str, Any]]:
         lifecycle = self.config.trade_lifecycle
         entry = lifecycle.entry
+        blocked_secids = set(blocked_secids or set())
         equity = max(float(account.equity), 1.0)
         current_weights = _position_weights(positions, prices, self.instruments_by_secid, equity)
         active_positions = {secid: int(lots or 0) for secid, lots in positions.items() if int(lots or 0) != 0}
         rows_by_secid = {row.secid: row for row in signals if row.signal_name == "kronos"}
         min_net_edge = float(entry.single_top_min_net_edge)
+        min_rank_gap = max(float(entry.single_top_min_rank_gap), 0.0)
         max_gross_pred_return = float(entry.single_top_max_gross_pred_return)
         target_abs_weight = _single_top_target_abs_weight(self.config, account)
 
@@ -1614,6 +1832,7 @@ class RuntimeEngine:
                 "target_weight": 0.0,
                 "same_as_current_position": False,
                 "single_top_passed_filters": False,
+                "blocked_by_exit_pass": secid in blocked_secids,
             }
             if pred_return is None:
                 item["reason"] = "missing_kronos_pred_return"
@@ -1652,21 +1871,45 @@ class RuntimeEngine:
         ranked.sort(key=lambda item: (-float(item["gross_pred_return"]), str(item["secid"])))
         for rank, item in enumerate(ranked, start=1):
             item["rank"] = rank
+            next_item = ranked[rank] if rank < len(ranked) else None
+            rank_gap_to_next = (
+                float(item["gross_pred_return"]) - float(next_item["gross_pred_return"])
+                if next_item is not None
+                else None
+            )
+            item["rank_gap_to_next"] = rank_gap_to_next
+            if rank == 1:
+                item["top1_top2_gross_gap"] = rank_gap_to_next
             if rank > 1:
-                item["reason"] = "not_top_1"
+                item["reason"] = "closed_in_exit_pass" if str(item["secid"]) in blocked_secids else "not_top_1"
 
         target_weights: dict[str, float] = {}
         top = ranked[0] if ranked else None
         top1_secid = str(top["secid"]) if top else ""
         top1_side = str(top["side"]) if top and top.get("side") else ""
-        top1_passed = bool(top and top.get("single_top_passed_filters"))
+        top1_top2_gross_gap = top.get("top1_top2_gross_gap") if top else None
+        if top is not None:
+            filter_reason = _single_top_filter_reason(
+                gross_pred_return=float(top["gross_pred_return"]),
+                net_edge=float(top["net_edge"]),
+                min_net_edge=min_net_edge,
+                max_gross_pred_return=max_gross_pred_return,
+                rank_gap=top1_top2_gross_gap,
+                min_rank_gap=min_rank_gap,
+            )
+            top["single_top_passed_filters"] = filter_reason == ""
+            top["filter_reason"] = filter_reason
         target_action = "close_to_cash" if active_positions else "skip_flat"
         action_reason = "missing_kronos_pred_return"
         selected_count = 0
 
         if top is not None:
             filter_reason = str(top.get("filter_reason") or "")
-            if filter_reason:
+            if top1_secid in blocked_secids:
+                top["single_top_passed_filters"] = False
+                top["reason"] = "closed_in_exit_pass"
+                action_reason = "closed_in_exit_pass"
+            elif filter_reason:
                 top["reason"] = filter_reason
                 action_reason = "single_top_close_to_cash" if active_positions else filter_reason
             elif target_abs_weight <= 0:
@@ -1693,6 +1936,7 @@ class RuntimeEngine:
                     top["allocated_weight"] = target_abs_weight
                     top["target_weight"] = target_weight
 
+        top1_passed = bool(top and top.get("single_top_passed_filters"))
         candidates = ranked + sorted(skipped, key=lambda item: str(item["secid"]))
         return target_weights, {
             "ranking_mode": "kronos_single_top",
@@ -1704,12 +1948,14 @@ class RuntimeEngine:
             "free_capital": _entry_free_value(account, self.config.risk),
             "free_weight": _entry_free_value(account, self.config.risk) / equity if equity > 0 else 0.0,
             "single_top_min_net_edge": min_net_edge,
+            "single_top_min_rank_gap": min_rank_gap,
             "single_top_max_gross_pred_return": max_gross_pred_return,
             "single_top_target_weight": float(entry.single_top_target_weight),
             "target_abs_weight": target_abs_weight,
             "selected_count": selected_count,
             "top1_secid": top1_secid,
             "top1_side": top1_side,
+            "top1_top2_gross_gap": top1_top2_gross_gap,
             "top1_passed_filters": top1_passed,
             "target_action": target_action,
             "action_reason": action_reason,
@@ -2179,11 +2425,15 @@ def _single_top_filter_reason(
     net_edge: float,
     min_net_edge: float,
     max_gross_pred_return: float,
+    rank_gap: float | None = None,
+    min_rank_gap: float = 0.0,
 ) -> str:
     if float(gross_pred_return) > float(max_gross_pred_return):
         return "single_top_gross_pred_return_cap"
     if float(net_edge) < float(min_net_edge):
         return "single_top_net_edge_below_min"
+    if rank_gap is not None and float(rank_gap) < float(min_rank_gap):
+        return "single_top_rank_gap_below_min"
     return ""
 
 
@@ -2317,6 +2567,7 @@ def _trading_session_state(as_of: datetime, config: TradingSessionConfig) -> dic
         "force_flat_required": state == "force_flat",
         "flat_all_asset_classes": bool(config.flat_all_asset_classes),
         "action_reason": reason,
+        "_entry_start_dt": entry_start,
         "_kronos_cutoff_dt": kronos_cutoff,
         "_force_flat_dt": force_flat_time,
     }
@@ -2339,6 +2590,82 @@ def _session_datetime(as_of: datetime, hhmm: str, tz: ZoneInfo) -> datetime:
 def _parse_hhmm(value: str) -> time:
     hour_raw, minute_raw = str(value).split(":", 1)
     return time(hour=int(hour_raw), minute=int(minute_raw))
+
+
+def _entry_recheck_deadline(session: Mapping[str, Any]) -> datetime | None:
+    values = [
+        value
+        for value in (session.get("_kronos_cutoff_dt"), session.get("_force_flat_dt"))
+        if isinstance(value, datetime)
+    ]
+    if not values:
+        return None
+    return min(values)
+
+
+def _entry_rebalance_tick_check(
+    *,
+    session: Mapping[str, Any],
+    decision_interval_minutes: int,
+) -> tuple[bool, dict[str, Any]]:
+    interval = max(int(decision_interval_minutes), 1)
+    if not bool(session.get("enabled", False)):
+        return True, {"enabled": False, "decision_interval_minutes": interval}
+    entry_start = session.get("_entry_start_dt")
+    local_as_of_raw = session.get("local_as_of")
+    if not isinstance(entry_start, datetime) or not local_as_of_raw:
+        return True, {"enabled": False, "decision_interval_minutes": interval, "reason": "session_anchor_missing"}
+    local_as_of = datetime.fromisoformat(str(local_as_of_raw))
+    elapsed_seconds = (local_as_of - entry_start).total_seconds()
+    elapsed_minutes = int(elapsed_seconds // 60)
+    aligned = (
+        elapsed_seconds >= 0
+        and local_as_of.second == 0
+        and local_as_of.microsecond == 0
+        and elapsed_minutes % interval == 0
+    )
+    next_rebalance_at = local_as_of if aligned else entry_start + timedelta(minutes=((elapsed_minutes // interval) + 1) * interval)
+    return aligned, {
+        "enabled": True,
+        "decision_interval_minutes": interval,
+        "entry_start_at": entry_start.isoformat(timespec="seconds"),
+        "as_of": local_as_of.isoformat(timespec="seconds"),
+        "next_rebalance_at": next_rebalance_at.isoformat(timespec="seconds"),
+        "minutes_since_entry_start": max(elapsed_minutes, 0),
+    }
+
+
+def _entry_recheck_window_check(
+    *,
+    as_of: datetime,
+    decision_interval_minutes: int,
+    max_target_time: datetime | None,
+) -> tuple[bool, dict[str, Any]]:
+    interval = max(int(decision_interval_minutes), 1)
+    if max_target_time is None:
+        return True, {
+            "enabled": False,
+            "decision_interval_minutes": interval,
+        }
+    local_as_of = _as_forecast_datetime(as_of, max_target_time.tzinfo)
+    next_recheck_at = local_as_of + timedelta(minutes=interval)
+    ok = next_recheck_at <= max_target_time
+    return ok, {
+        "enabled": True,
+        "decision_interval_minutes": interval,
+        "as_of": local_as_of.isoformat(timespec="seconds"),
+        "next_recheck_at": next_recheck_at.isoformat(timespec="seconds"),
+        "max_recheck_time": max_target_time.isoformat(timespec="seconds"),
+        "remaining_minutes": max((max_target_time - local_as_of).total_seconds() / 60.0, 0.0),
+        "violations": []
+        if ok
+        else [
+            {
+                "next_recheck_at": next_recheck_at.isoformat(timespec="seconds"),
+                "max_recheck_time": max_target_time.isoformat(timespec="seconds"),
+            }
+        ],
+    }
 
 
 def _kronos_horizon_check(

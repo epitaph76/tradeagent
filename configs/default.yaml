@@ -7,6 +7,7 @@ universe:
 
 rebalance:
   decision_interval_minutes: 60
+  exit_interval_minutes: 1
 
 trading_session:
   enabled: true
@@ -20,8 +21,8 @@ trading_session:
   flat_all_asset_classes: true
 
 portfolio:
-  max_positions: 8
-  min_abs_weight: 0.03
+  max_positions: 5
+  min_abs_weight: 0.02
   max_gross: 1.0
   min_hold_minutes: 60
   strong_flip_threshold: 0.85
@@ -30,8 +31,8 @@ risk:
   starting_cash: 100000
   min_order_value_rub: 500
   min_position_change_weight: 0.01
-  max_orders_per_rebalance: 12
-  max_new_positions_per_rebalance: 4
+  max_orders_per_rebalance: 4
+  max_new_positions_per_rebalance: 1
   max_daily_orders: 100
   commission_rate: 0.0005
   slippage_spread_multiplier: 0.5
@@ -64,13 +65,17 @@ kronos:
   cache_enabled: true
 
 trade_lifecycle:
-  max_total_positions: 5
+  max_total_positions: 1
   exit:
     enabled: true
     pred_len: 4
     sample_count: 15
     edge_threshold: 0.0
-    particle_enabled: true
+    edge_enabled: false
+    giveback_enabled: true
+    giveback_min_arm_profit: 0.012
+    giveback_ratio: 0.60
+    particle_enabled: false
     particle_horizon: 8
     particle_sample_count: 20
     particle_min_expected_profit: 0.0015
@@ -80,19 +85,143 @@ trade_lifecycle:
     particle_extend_min_improvement: 0.0015
     particle_max_extensions: 1
   entry:
-    mode: kronos_rank
+    mode: kronos_single_top
     include_held_for_topup: true
     capital_mode: free_only
     topup_sizing: rank_budget
     rank_power: 2.0
     ranking_metric: abs_edge
     single_top_min_net_edge: 0.0015
+    single_top_min_rank_gap: 0.0004
     single_top_max_gross_pred_return: 0.0075
     single_top_target_weight: 1.0
 
-# Non-equity instruments are supported but intentionally not guessed.
-# Add futures/crypto explicitly, for example:
-# instruments:
-#   - {secid: SBER, asset_class: equity, lot_size: 1}
-#   - {secid: YOUR_FUTURE_SECID, asset_class: future, lot_size: 1}
-#   - {secid: YOUR_CRYPTO_SECID, asset_class: crypto, lot_size: 1, quote_currency: USDT}
+instruments:
+  - secid: VTBR
+    asset_class: equity
+    lot_size: 1
+  - secid: AFLT
+    asset_class: equity
+    lot_size: 10
+  - secid: PIKK
+    asset_class: equity
+    lot_size: 1
+  - secid: YDEX
+    asset_class: equity
+    lot_size: 1
+  - secid: X5
+    asset_class: equity
+    lot_size: 1
+  - secid: NVTK
+    asset_class: equity
+    lot_size: 1
+  - secid: PLZL
+    asset_class: equity
+    lot_size: 1
+  - secid: GMKN
+    asset_class: equity
+    lot_size: 10
+  - secid: ALRS
+    asset_class: equity
+    lot_size: 10
+  - secid: MGNT
+    asset_class: equity
+    lot_size: 1
+  - secid: BRN6
+    asset_class: future
+    lot_size: 1
+  - secid: NGM6
+    asset_class: future
+    lot_size: 1
+  - secid: GDM6
+    asset_class: future
+    lot_size: 1
+  - secid: SiM6
+    asset_class: future
+    lot_size: 1
+  - secid: CRM6
+    asset_class: future
+    lot_size: 1
+  - secid: MMM6
+    asset_class: future
+    lot_size: 1
+  - secid: BTCUSDT
+    asset_class: crypto
+    lot_size: 1
+    quote_currency: USDT
+  - secid: ETHUSDT
+    asset_class: crypto
+    lot_size: 1
+    quote_currency: USDT
+  - secid: SOLUSDT
+    asset_class: crypto
+    lot_size: 1
+    quote_currency: USDT
+  - secid: BNBUSDT
+    asset_class: crypto
+    lot_size: 1
+    quote_currency: USDT
+
+base_selectors:
+  - name: selector_kronos_core
+    signal_weights:
+      kronos: 1.0
+    threshold: 0.65
+    rank_power: 2.0
+    max_positions: 6
+    max_long_positions: 3
+    max_short_positions: 3
+    asset_filter: [equity]
+  - name: selector_kronos_aggressive
+    signal_weights:
+      kronos: 1.0
+    threshold: 0.60
+    rank_power: 1.5
+    max_positions: 8
+    max_long_positions: 4
+    max_short_positions: 4
+    asset_filter: [equity]
+  - name: selector_kronos_conservative
+    signal_weights:
+      kronos: 1.0
+    threshold: 0.75
+    rank_power: 2.5
+    max_positions: 4
+    max_long_positions: 2
+    max_short_positions: 2
+    asset_filter: [equity]
+  - name: selector_futures_view
+    signal_weights:
+      kronos: 1.0
+    threshold: 0.62
+    rank_power: 2.0
+    max_positions: 3
+    max_long_positions: 2
+    max_short_positions: 1
+    asset_filter: [future]
+  - name: selector_crypto_view
+    signal_weights:
+      kronos: 1.0
+    threshold: 0.62
+    rank_power: 2.0
+    max_positions: 2
+    max_long_positions: 1
+    max_short_positions: 1
+    asset_filter: [crypto]
+  - name: selector_cross_asset
+    signal_weights:
+      kronos: 1.0
+    threshold: 0.68
+    rank_power: 2.0
+    max_positions: 8
+    max_long_positions: 4
+    max_short_positions: 4
+
+market_data:
+  saved_candles:
+    history_rows: 512
+    filename_patterns:
+      - "candles_{secid}.csv"
+      - "candles_1m_{secid}.csv"
+    directories:
+      - data/universe-v1-may1-14/candles

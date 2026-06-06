@@ -91,6 +91,7 @@ class RiskConfig:
 @dataclass(frozen=True)
 class RebalanceConfig:
     decision_interval_minutes: int = 60
+    exit_interval_minutes: int = 1
 
 
 @dataclass(frozen=True)
@@ -138,6 +139,10 @@ class TradeLifecycleExitConfig:
     pred_len: int = 4
     sample_count: int = 15
     edge_threshold: float = 0.0
+    edge_enabled: bool = True
+    giveback_enabled: bool = False
+    giveback_min_arm_profit: float = 0.012
+    giveback_ratio: float = 0.60
     particle_enabled: bool = False
     particle_horizon: int = 8
     particle_sample_count: int = 20
@@ -158,6 +163,7 @@ class TradeLifecycleEntryConfig:
     rank_power: float = 2.0
     ranking_metric: str = "abs_edge"
     single_top_min_net_edge: float = 0.0015
+    single_top_min_rank_gap: float = 0.0
     single_top_max_gross_pred_return: float = 0.0075
     single_top_target_weight: float = 1.0
 

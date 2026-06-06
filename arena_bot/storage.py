@@ -107,6 +107,15 @@ class StateStore:
                     confidence REAL NOT NULL,
                     state_json TEXT NOT NULL DEFAULT '{}'
                 );
+                CREATE TABLE IF NOT EXISTS position_giveback_state (
+                    secid TEXT PRIMARY KEY,
+                    side TEXT NOT NULL,
+                    entry_price REAL NOT NULL,
+                    mfe_pct REAL NOT NULL,
+                    last_pnl_pct REAL NOT NULL,
+                    opened_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
 
@@ -368,6 +377,71 @@ class StateStore:
         with self.connect() as conn:
             conn.execute("DELETE FROM kronos_exit_trackers WHERE secid = ?", (str(secid),))
 
+    def save_position_giveback_state(
+        self,
+        *,
+        secid: str,
+        side: str,
+        entry_price: float,
+        mfe_pct: float,
+        last_pnl_pct: float,
+        opened_at: str,
+        updated_at: str,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO position_giveback_state(
+                    secid, side, entry_price, mfe_pct, last_pnl_pct, opened_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(secid) DO UPDATE SET
+                    side=excluded.side,
+                    entry_price=excluded.entry_price,
+                    mfe_pct=excluded.mfe_pct,
+                    last_pnl_pct=excluded.last_pnl_pct,
+                    opened_at=excluded.opened_at,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    str(secid),
+                    str(side),
+                    float(entry_price),
+                    float(mfe_pct),
+                    float(last_pnl_pct),
+                    str(opened_at),
+                    str(updated_at),
+                ),
+            )
+
+    def load_position_giveback_state(self, secid: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT secid, side, entry_price, mfe_pct, last_pnl_pct, opened_at, updated_at
+                FROM position_giveback_state
+                WHERE secid = ?
+                """,
+                (str(secid),),
+            ).fetchone()
+        if row is None:
+            return None
+        return _giveback_state_from_row(row)
+
+    def load_position_giveback_states(self) -> dict[str, dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT secid, side, entry_price, mfe_pct, last_pnl_pct, opened_at, updated_at
+                FROM position_giveback_state
+                """
+            ).fetchall()
+        return {row["secid"]: _giveback_state_from_row(row) for row in rows}
+
+    def delete_position_giveback_state(self, secid: str) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM position_giveback_state WHERE secid = ?", (str(secid),))
+
     def load_selector_return_history(self, *, limit: int = 512) -> list[dict[str, Any]]:
         with self.connect() as conn:
             rows = conn.execute(
@@ -532,6 +606,18 @@ class StateStore:
                 "updated_at": row["updated_at"],
             }
         return out
+
+
+def _giveback_state_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "secid": row["secid"],
+        "side": row["side"],
+        "entry_price": float(row["entry_price"]),
+        "mfe_pct": float(row["mfe_pct"]),
+        "last_pnl_pct": float(row["last_pnl_pct"]),
+        "opened_at": row["opened_at"],
+        "updated_at": row["updated_at"],
+    }
 
 
 def _now() -> str:

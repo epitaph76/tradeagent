@@ -7,6 +7,7 @@ universe:
 
 rebalance:
   decision_interval_minutes: 60
+  exit_interval_minutes: 1
 
 trading_session:
   enabled: true
@@ -66,10 +67,14 @@ kronos:
 trade_lifecycle:
   max_total_positions: 1
   exit:
-    enabled: false
+    enabled: true
     pred_len: 4
     sample_count: 15
     edge_threshold: 0.0
+    edge_enabled: false
+    giveback_enabled: true
+    giveback_min_arm_profit: 0.012
+    giveback_ratio: 0.60
     particle_enabled: false
     particle_horizon: 8
     particle_sample_count: 20
@@ -87,6 +92,7 @@ trade_lifecycle:
     rank_power: 2.0
     ranking_metric: abs_edge
     single_top_min_net_edge: 0.0015
+    single_top_min_rank_gap: 0.0004
     single_top_max_gross_pred_return: 0.0075
     single_top_target_weight: 1.0
 

@@ -25,7 +25,7 @@ def test_estimate_equity_uses_signed_mark_to_market(tmp_path):
     assert manager.gross_value({"LONG": 10, "SHORT": -5}, {"LONG": 100.0, "SHORT": 200.0}) == 2000.0
 
 
-def test_no_leverage_filter_blocks_unfunded_buy():
+def test_no_leverage_filter_downsizes_unfunded_buy_to_cash_buffer():
     instruments = {"SBER": Instrument("SBER")}
     risk = RiskConfig(starting_cash=100000, commission_rate=0.0005, cash_buffer_pct=0.02)
     order = PlannedOrder(
@@ -53,9 +53,12 @@ def test_no_leverage_filter_blocks_unfunded_buy():
         max_gross=1.0,
     )
 
-    assert accepted == []
-    assert blocked[0]["reason"] in {"risk_cash_insufficient", "risk_gross_cap"}
-    assert account.cash == 100000.0
+    assert blocked == []
+    assert len(accepted) == 1
+    assert accepted[0].quantity < order.quantity
+    assert accepted[0].target_lots == accepted[0].quantity
+    assert account.cash >= account.cash_buffer
+    assert account.cash < 100000.0
 
 
 def test_short_uses_full_collateral_without_creating_extra_capacity():

@@ -6,14 +6,15 @@ This file is the fastest entry point for coding agents working on this repo.
 
 Tradeagent is a compact paper/live trading runtime for a 20-instrument universe. It combines:
 
-- Kronos candle forecasts for entry ranking and exit forecasts.
+- Kronos candle forecasts for entry ranking.
 - Round-trip risk filtering for new entries.
-- Particle-style Kronos path tracking for exits.
+- Giveback trailing exits based on MFE inside the open position.
+- Optional particle-style Kronos path tracking for exits.
 - A Moscow trading-session guard that keeps the bot cash-flat near session close.
 - A LightGBM meta-selector path that is still present and tested.
 - Saved-candle runtime backtests for the May 1-14 dataset.
 
-The main May 1-14 config currently runs the experimental `kronos_single_top` mode. `kronos_rank` remains implemented and covered by tests, and `configs/default.yaml` keeps that more conservative mode.
+The main May 1-14 config and `configs/default.yaml` currently use the `kronos_single_top` baseline with giveback trailing exits. `kronos_rank` remains implemented and covered by tests, but is no longer the default config strategy.
 
 ## Repository Map
 
@@ -22,7 +23,7 @@ The main May 1-14 config currently runs the experimental `kronos_single_top` mod
 - `arena_bot/runtime.py` is the main decision engine: session guard, exit pass, risk cap pass, entry pass, order planning, diagnostics.
 - `arena_bot/kronos_provider.py` wraps the local Kronos model and cache, including `score()` and `forecast_paths()`.
 - `arena_bot/runtime_backtest.py` replays saved candles through the full runtime and exports trades/account/ranking diagnostics.
-- `arena_bot/storage.py` owns SQLite tables for state, decisions, cached Kronos forecasts, paper positions, and particle trackers.
+- `arena_bot/storage.py` owns SQLite tables for state, decisions, cached Kronos forecasts, paper positions, giveback state, and particle trackers.
 - `arena_bot/market_data.py` provides saved-candle market data and computed market metrics.
 - `arena_bot/meta_selector.py` keeps the LightGBM selector model path.
 - `configs/universe_v1_may1_14.yaml` is the main current config.
@@ -54,7 +55,12 @@ The May 1-14 experiment config uses:
 trade_lifecycle:
   max_total_positions: 1
   exit:
-    enabled: false
+    enabled: true
+    giveback_enabled: true
+    giveback_min_arm_profit: 0.012
+    giveback_ratio: 0.60
+    edge_enabled: false
+    particle_enabled: false
   entry:
     mode: kronos_single_top
 ```
@@ -62,22 +68,17 @@ trade_lifecycle:
 `kronos_single_top` behavior:
 
 - Calls Kronos `score()` for the full selected universe each trading hour.
+- Entry is gated to the configured `decision_interval_minutes`; minute runtime ticks between those slots are exit-only.
 - Ranks candidates by `gross_pred_return = abs(pred_return)`.
 - Takes rank-1 only; no lower-ranked replacement is backfilled.
 - Computes spread, commission, slippage, round-trip cost, and `net_edge`.
-- Enters only if `net_edge >= single_top_min_net_edge` and `gross_pred_return <= single_top_max_gross_pred_return`.
+- Enters only if `net_edge >= single_top_min_net_edge`, `gross_pred_return <= single_top_max_gross_pred_return`, and `rank1.gross_pred_return - rank2.gross_pred_return >= single_top_min_rank_gap`.
+- The current experiment sets `single_top_min_rank_gap: 0.0004`, i.e. `0.04%`.
+- Entries are also blocked unless `as_of + decision_interval_minutes` fits before both `kronos_cutoff` and `force_flat_time`, so there is a full next Kronos reassessment interval available.
 - Targets near full capital using `cash_buffer_pct` and `sizing_safety_pct`.
 - If the current position is the same `secid` and same side as rank-1, it holds without close/reopen.
 - If rank-1 changes, flips side, or fails filters, rebalance orders close the old position; a passing new rank-1 is opened immediately.
 - `entry_diagnostics.ranked_candidates` is always populated when Kronos entry is allowed, so `runtime_backtest.py` writes hourly `ranked_top.jsonl` rows.
-
-`configs/default.yaml` and tests still cover:
-
-```yaml
-trade_lifecycle:
-  entry:
-    mode: kronos_rank
-```
 
 `kronos_rank` behavior:
 
@@ -94,6 +95,15 @@ trade_lifecycle:
 
 ## Exit Logic
 
+The active single-top baseline uses giveback trailing:
+
+- Each held position stores `entry_price`, side, `mfe_pct`, and `last_pnl_pct`.
+- `run-live` calls the runtime every `rebalance.exit_interval_minutes`, currently every minute, so giveback updates independently of hourly entry reassessment.
+- Existing positions without giveback state are bootstrapped from the current mark price with `mfe_pct=0`, so startup does not immediately close them.
+- A position arms at `giveback_min_arm_profit: 0.012`.
+- It closes when `(mfe_pct - current_pnl_pct) / mfe_pct >= giveback_ratio`, currently `0.60`.
+- A giveback close blocks same-tick reopening of that `secid` in `kronos_single_top`.
+
 If `trade_lifecycle.exit.particle_enabled=true`, exits use particle tracking when possible:
 
 - A tracker stores raw Kronos sample paths, weights, current step, confidence, planned exit, and extension count.
@@ -103,7 +113,7 @@ If `trade_lifecycle.exit.particle_enabled=true`, exits use particle tracking whe
 - If fewer than 3 future candles fit, the tracker uses only the next candle.
 - If tracker creation/refresh is impossible, runtime can fall back to legacy edge exit.
 
-Legacy edge exit still exists and compares directional `pred_return` against one-way exit cost.
+Legacy edge exit still exists and compares directional `pred_return` against one-way exit cost when `edge_enabled=true`.
 
 ## Trading Session Rules
 
@@ -116,7 +126,7 @@ Defaults are in `TradingSessionConfig`:
 - Force-flat runs at `18:30`.
 - `flat_all_asset_classes=true`, so equities, futures, and crypto are all closed in the v1 MOEX-style session.
 
-Kronos forecasts must fit inside session limits. Entry uses `kronos_cutoff`; particle exit clips to `force_flat_time`.
+Kronos forecasts and the next entry reassessment interval must fit inside session limits. Entry uses `kronos_cutoff`; particle exit clips to `force_flat_time`.
 
 ## Commands
 

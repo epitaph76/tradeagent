@@ -1,14 +1,15 @@
 # Tradeagent
 
-Trading runtime built around Kronos forecasts, LightGBM selector metadata, risk filters, trading-session guards, and particle-based exit tracking.
+Trading runtime built around Kronos forecasts, LightGBM selector metadata, risk filters, trading-session guards, and giveback trailing exits.
 
 For coding agents, start with [AGENTS.md](AGENTS.md). It explains the current architecture, runtime flow, implemented strategy modes, commands, and safe working rules.
 
 ## What Is Implemented
 
 - `kronos_rank` entry mode: Kronos ranks candidates, then the runtime applies strict round-trip cost filtering.
-- `kronos_single_top` entry mode: hourly full-capital experiment that ranks the universe, trades only rank-1 if strict filters pass, and closes/switches through rebalance orders.
-- Particle exit tracking: open positions can be accompanied by Kronos sample paths and weighted exit planning.
+- `kronos_single_top` entry mode: hourly full-capital baseline that ranks the universe, trades only rank-1 if strict cost, gross-return, and top1/top2 gap filters pass, and blocks entries unless a full next Kronos reassessment interval remains.
+- Giveback trailing exits: open positions track MFE on every runtime tick; `run-live` ticks every minute while entries remain hourly.
+- Particle exit tracking: still implemented for configs that enable Kronos sample-path exits.
 - Session-safe trading: v1 uses a single `Europe/Moscow` window and forces all assets cash-flat near session close.
 - LightGBM meta-selector support: model loading/training code and latest compact model are kept in the repo.
 - Saved-candle backtests: the current May 1-14 dataset is included for reproducible runtime checks.

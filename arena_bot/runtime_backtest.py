@@ -59,7 +59,7 @@ def run(args: argparse.Namespace) -> None:
 
     state = StateStore(run_state_path)
     with state.connect() as conn:
-        for table in ("paper_positions", "orders", "decisions", "selector_paper_positions", "account_state"):
+        for table in ("paper_positions", "orders", "decisions", "selector_paper_positions", "account_state", "position_giveback_state"):
             conn.execute(f"DELETE FROM {table}")
         conn.commit()
 

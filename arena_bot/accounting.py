@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import Any, Mapping
 
 from .types import AccountState, Instrument, PlannedOrder, RiskConfig
@@ -130,6 +130,36 @@ def filter_orders_no_leverage(
             max_gross=max_gross,
             risk=risk,
         )
+        if reason in _DOWNSIZABLE_RISK_REASONS and not _reduces_exposure(order, projected_positions):
+            adjusted = _downsize_order_to_fit(
+                order=order,
+                cash=projected_cash,
+                positions=projected_positions,
+                prices=prices,
+                instruments=instruments,
+                risk=risk,
+                max_gross=max_gross,
+            )
+            if adjusted is not None:
+                order = adjusted
+                next_cash = apply_order_cash(projected_cash, order, risk)
+                next_positions = positions_after_order(projected_positions, order)
+                account = mark_account(
+                    cash=next_cash,
+                    positions=next_positions,
+                    prices=prices,
+                    instruments=instruments,
+                    risk=risk,
+                    max_gross=max_gross,
+                )
+                reason = _risk_block_reason(
+                    order=order,
+                    before_positions=projected_positions,
+                    after=account,
+                    max_gross=max_gross,
+                    risk=risk,
+                )
+
         if reason:
             blocked.append(
                 {
@@ -180,6 +210,102 @@ def _risk_block_reason(
     if after.available_gross <= 0 and max(after.gross, after.margin_used) > gross_limit + 1e-9:
         return "risk_capacity_insufficient"
     return ""
+
+
+_DOWNSIZABLE_RISK_REASONS = {
+    "risk_cash_insufficient",
+    "risk_gross_cap",
+    "risk_margin_cap",
+    "risk_capacity_insufficient",
+}
+
+
+def _downsize_order_to_fit(
+    *,
+    order: PlannedOrder,
+    cash: float,
+    positions: Mapping[str, int],
+    prices: Mapping[str, float],
+    instruments: Mapping[str, Instrument],
+    risk: RiskConfig,
+    max_gross: float,
+) -> PlannedOrder | None:
+    instrument = instruments.get(order.secid)
+    if instrument is None or instrument.lot_size <= 0 or order.quantity <= 1:
+        return None
+    mark_price = float(prices.get(order.secid, 0.0) or 0.0)
+    if mark_price <= 0 or order.price <= 0:
+        return None
+
+    before = mark_account(
+        cash=cash,
+        positions=positions,
+        prices=prices,
+        instruments=instruments,
+        risk=risk,
+        max_gross=max_gross,
+    )
+    best: PlannedOrder | None = None
+    low = 1
+    high = int(order.quantity) - 1
+    while low <= high:
+        quantity = (low + high) // 2
+        candidate = _resize_order(order, quantity=quantity, mark_price=mark_price, equity=before.equity)
+        if candidate.order_value < float(risk.min_order_value_rub):
+            low = quantity + 1
+            continue
+        next_cash = apply_order_cash(cash, candidate, risk)
+        next_positions = positions_after_order(positions, candidate)
+        account = mark_account(
+            cash=next_cash,
+            positions=next_positions,
+            prices=prices,
+            instruments=instruments,
+            risk=risk,
+            max_gross=max_gross,
+        )
+        reason = _risk_block_reason(
+            order=candidate,
+            before_positions=positions,
+            after=account,
+            max_gross=max_gross,
+            risk=risk,
+        )
+        if reason:
+            high = quantity - 1
+        else:
+            best = candidate
+            low = quantity + 1
+    return best
+
+
+def _resize_order(order: PlannedOrder, *, quantity: int, mark_price: float, equity: float) -> PlannedOrder:
+    quantity = max(int(quantity), 0)
+    delta = quantity if order.direction == "B" else -quantity
+    target_lots = int(order.current_lots) + delta
+    target_weight = 0.0
+    if equity > 0:
+        target_weight = target_lots * int(order.lot_size) * float(mark_price) / float(equity)
+    return replace(
+        order,
+        quantity=quantity,
+        target_lots=target_lots,
+        order_value=quantity * int(order.lot_size) * float(order.price),
+        target_weight=target_weight,
+        order_kind=_order_kind_for_lots(int(order.current_lots), target_lots),
+    )
+
+
+def _order_kind_for_lots(current_lots: int, target_lots: int) -> str:
+    if current_lots == 0 and target_lots != 0:
+        return "open"
+    if current_lots != 0 and target_lots == 0:
+        return "close_reduce"
+    if current_lots > 0 and target_lots < current_lots:
+        return "sell_reduce"
+    if current_lots < 0 and target_lots > current_lots:
+        return "buy_reduce"
+    return "increase"
 
 
 def _reduces_exposure(order: PlannedOrder, positions: Mapping[str, int]) -> bool:

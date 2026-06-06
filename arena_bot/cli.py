@@ -116,12 +116,15 @@ def _diagnose(args: argparse.Namespace) -> int:
 
 def _run_live(args: argparse.Namespace) -> int:
     engine = _build_engine(args.config)
-    interval = max(engine.config.rebalance.decision_interval_minutes, 1)
+    interval = max(int(getattr(engine.config.rebalance, "exit_interval_minutes", 1)), 1)
+    last_run: datetime | None = None
     while True:
-        now = datetime.now()
-        engine.run_once(now)
+        now = _floor_to_interval_minute(datetime.now(), interval)
+        if last_run is None or now > last_run:
+            engine.run_once(now)
+            last_run = now
         next_run = now + timedelta(minutes=interval)
-        sleep_seconds = max((next_run - datetime.now()).total_seconds(), 1.0)
+        sleep_seconds = max((next_run - datetime.now()).total_seconds(), 0.5)
         time.sleep(sleep_seconds)
 
 
@@ -140,6 +143,13 @@ def _train_lightgbm(args: argparse.Namespace) -> int:
     )
     print(json.dumps(metadata, ensure_ascii=False, indent=2, default=str))
     return 0
+
+
+def _floor_to_interval_minute(value: datetime, interval_minutes: int) -> datetime:
+    interval = max(int(interval_minutes), 1)
+    minute_of_day = value.hour * 60 + value.minute
+    floored = minute_of_day - (minute_of_day % interval)
+    return value.replace(hour=floored // 60, minute=floored % 60, second=0, microsecond=0)
 
 
 def _historical_batch(args: argparse.Namespace) -> int:

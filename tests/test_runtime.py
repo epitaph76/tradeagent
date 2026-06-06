@@ -270,6 +270,38 @@ def test_session_blocks_entry_when_kronos_horizon_exceeds_cutoff(tmp_path: Path)
     assert payload["entry_diagnostics"]["reason"] == "session_kronos_horizon_exceeds_close"
 
 
+def test_session_blocks_entry_when_next_kronos_recheck_would_miss_cutoff(tmp_path: Path):
+    as_of = datetime(2026, 6, 3, 16, 45)
+    provider = ForecastSignalProvider({"SBER": 0.05})
+    engine = _engine(
+        tmp_path,
+        mode="paper",
+        scores={"SBER": 0.95},
+        entry_mode="kronos_rank",
+        trading_session=_session_config(),
+        kronos_provider=provider,
+        candles_by_secid={
+            "SBER": _candles(
+                [datetime(2026, 6, 3, 15, 0), datetime(2026, 6, 3, 16, 0)],
+                [99.0, 100.0],
+            ),
+            "LKOH": _candles(
+                [datetime(2026, 6, 3, 15, 0), datetime(2026, 6, 3, 16, 0)],
+                [99.0, 100.0],
+            ),
+        },
+    )
+
+    result = engine.run_once(as_of)
+    payload = _decision_payload(engine, result.decision_id)
+
+    assert not result.orders
+    assert provider.calls == 0
+    assert payload["session_state"] == "trade"
+    assert payload["entry_diagnostics"]["reason"] == "session_kronos_recheck_window_too_short"
+    assert payload["entry_diagnostics"]["entry_recheck_window"]["next_recheck_at"].startswith("2026-06-03T17:45:00")
+
+
 def test_session_clips_particle_tracker_horizon_to_force_flat(tmp_path: Path):
     as_of = datetime(2026, 6, 3, 16, 0)
     timestamps = [as_of + timedelta(hours=idx) for idx in range(1, 5)]
@@ -409,6 +441,238 @@ def test_exit_pass_closes_weak_held_before_entry_opens_new_position(tmp_path: Pa
     assert any(order.secid == "SBER" and order.direction == "S" and order.request.get("reason") == "exit_pass" for order in result.orders)
     assert "SBER" not in positions
     assert "LKOH" in positions
+
+
+def test_giveback_bootstraps_existing_position_without_immediate_close(tmp_path: Path):
+    as_of = datetime(2026, 6, 3, 17, 45)
+    engine = _engine(
+        tmp_path,
+        mode="paper",
+        scores={"SBER": 0.95},
+        exit_enabled=True,
+        edge_enabled=False,
+        giveback_enabled=True,
+        trading_session=_session_config(),
+    )
+    engine.state.upsert_paper_position("SBER", 10, 0.1, (as_of - timedelta(hours=2)).isoformat(timespec="seconds"))
+
+    result = engine.run_once(as_of)
+    payload = _decision_payload(engine, result.decision_id)
+    state = engine.state.load_position_giveback_state("SBER")
+
+    assert not result.orders
+    assert state is not None
+    assert state["entry_price"] == 100.0
+    assert state["mfe_pct"] == 0.0
+    assert payload["exit_diagnostics"]["held"]["SBER"]["state_bootstrapped"] is True
+    assert payload["exit_diagnostics"]["held"]["SBER"]["action_reason"] == "giveback_not_armed"
+
+
+def test_giveback_mfe_below_arm_profit_does_not_close(tmp_path: Path):
+    as_of = datetime(2026, 6, 3, 17, 45)
+    engine = _engine(
+        tmp_path,
+        mode="paper",
+        scores={"SBER": 0.95},
+        exit_enabled=True,
+        edge_enabled=False,
+        giveback_enabled=True,
+        trading_session=_session_config(),
+    )
+    engine.state.upsert_paper_position("SBER", 10, 0.1, (as_of - timedelta(hours=2)).isoformat(timespec="seconds"))
+    engine.state.save_position_giveback_state(
+        secid="SBER",
+        side="long",
+        entry_price=100.0,
+        mfe_pct=0.011,
+        last_pnl_pct=0.011,
+        opened_at=(as_of - timedelta(hours=2)).isoformat(timespec="seconds"),
+        updated_at=(as_of - timedelta(hours=1)).isoformat(timespec="seconds"),
+    )
+    engine.market_data.snapshot_rows = {
+        **engine.market_data.snapshot_rows,
+        "SBER": MarketSnapshot("SBER", last_price=101.1, bid=101.0, ask=101.2),
+    }
+
+    result = engine.run_once(as_of)
+    payload = _decision_payload(engine, result.decision_id)
+
+    assert not result.orders
+    assert engine.state.load_position_giveback_state("SBER")["mfe_pct"] < 0.012
+    assert payload["exit_diagnostics"]["held"]["SBER"]["giveback_armed"] is False
+
+
+def test_giveback_updates_mfe_without_closing_while_profit_expands(tmp_path: Path):
+    as_of = datetime(2026, 6, 3, 17, 45)
+    engine = _engine(
+        tmp_path,
+        mode="paper",
+        scores={"SBER": 0.95},
+        exit_enabled=True,
+        edge_enabled=False,
+        giveback_enabled=True,
+        trading_session=_session_config(),
+    )
+    engine.state.upsert_paper_position("SBER", 10, 0.1, (as_of - timedelta(hours=2)).isoformat(timespec="seconds"))
+    engine.state.save_position_giveback_state(
+        secid="SBER",
+        side="long",
+        entry_price=100.0,
+        mfe_pct=0.012,
+        last_pnl_pct=0.012,
+        opened_at=(as_of - timedelta(hours=2)).isoformat(timespec="seconds"),
+        updated_at=(as_of - timedelta(hours=1)).isoformat(timespec="seconds"),
+    )
+    engine.market_data.snapshot_rows = {
+        **engine.market_data.snapshot_rows,
+        "SBER": MarketSnapshot("SBER", last_price=102.4, bid=102.3, ask=102.5),
+    }
+
+    result = engine.run_once(as_of)
+    payload = _decision_payload(engine, result.decision_id)
+    state = engine.state.load_position_giveback_state("SBER")
+
+    assert not result.orders
+    assert state["mfe_pct"] > 0.023
+    assert payload["exit_diagnostics"]["held"]["SBER"]["giveback_armed"] is True
+    assert payload["exit_diagnostics"]["held"]["SBER"]["action_reason"] == "giveback_armed_hold"
+
+
+def test_giveback_closes_after_sixty_percent_profit_giveback(tmp_path: Path):
+    as_of = datetime(2026, 6, 3, 17, 45)
+    engine = _engine(
+        tmp_path,
+        mode="paper",
+        scores={"SBER": 0.95},
+        exit_enabled=True,
+        edge_enabled=False,
+        giveback_enabled=True,
+        trading_session=_session_config(),
+    )
+    engine.state.upsert_paper_position("SBER", 10, 0.1, (as_of - timedelta(hours=2)).isoformat(timespec="seconds"))
+    engine.state.save_position_giveback_state(
+        secid="SBER",
+        side="long",
+        entry_price=100.0,
+        mfe_pct=0.024,
+        last_pnl_pct=0.024,
+        opened_at=(as_of - timedelta(hours=2)).isoformat(timespec="seconds"),
+        updated_at=(as_of - timedelta(hours=1)).isoformat(timespec="seconds"),
+    )
+    engine.market_data.snapshot_rows = {
+        **engine.market_data.snapshot_rows,
+        "SBER": MarketSnapshot("SBER", last_price=100.9, bid=100.8, ask=101.0),
+    }
+
+    result = engine.run_once(as_of)
+    payload = _decision_payload(engine, result.decision_id)
+
+    assert any(order.secid == "SBER" and order.request.get("reason") == "exit_pass" for order in result.orders)
+    assert "SBER" not in engine.state.load_paper_positions()
+    assert engine.state.load_position_giveback_state("SBER") is None
+    assert payload["exit_diagnostics"]["held"]["SBER"]["action_reason"] == "giveback_trailing"
+    assert payload["exit_diagnostics"]["held"]["SBER"]["giveback_ratio"] >= 0.60
+
+
+def test_giveback_close_blocks_same_tick_single_top_reopen(tmp_path: Path):
+    as_of = datetime(2026, 6, 3, 12, 0)
+    engine = _engine(
+        tmp_path,
+        mode="paper",
+        scores={},
+        forecast_returns={"SBER": 0.006, "LKOH": 0.005},
+        entry_mode="kronos_single_top",
+        exit_enabled=True,
+        edge_enabled=False,
+        giveback_enabled=True,
+        trading_session=_session_config(),
+        portfolio_max_positions=1,
+    )
+    engine.state.upsert_paper_position("SBER", 10, 0.1, (as_of - timedelta(hours=2)).isoformat(timespec="seconds"))
+    engine.state.save_position_giveback_state(
+        secid="SBER",
+        side="long",
+        entry_price=100.0,
+        mfe_pct=0.024,
+        last_pnl_pct=0.024,
+        opened_at=(as_of - timedelta(hours=2)).isoformat(timespec="seconds"),
+        updated_at=(as_of - timedelta(hours=1)).isoformat(timespec="seconds"),
+    )
+    engine.market_data.snapshot_rows = {
+        **engine.market_data.snapshot_rows,
+        "SBER": MarketSnapshot("SBER", last_price=100.9, bid=100.8, ask=101.0),
+    }
+
+    result = engine.run_once(as_of)
+    payload = _decision_payload(engine, result.decision_id)
+    by_secid = {row["secid"]: row for row in payload["entry_ranked_candidates"]}
+
+    assert [order for order in result.orders if order.secid == "SBER" and order.request.get("order_kind") == "close_reduce"]
+    assert not [order for order in result.orders if order.secid == "SBER" and order.request.get("order_kind") == "open"]
+    assert by_secid["SBER"]["reason"] == "closed_in_exit_pass"
+    assert by_secid["SBER"]["single_top_passed_filters"] is False
+    assert payload["entry_diagnostics"]["action_reason"] == "closed_in_exit_pass"
+
+
+def test_giveback_runs_on_minute_tick_without_entry_rebalance(tmp_path: Path):
+    as_of = datetime(2026, 6, 3, 12, 1)
+    provider = ForecastSignalProvider({"SBER": 0.006, "LKOH": 0.005})
+    engine = _engine(
+        tmp_path,
+        mode="paper",
+        scores={},
+        entry_mode="kronos_single_top",
+        exit_enabled=True,
+        edge_enabled=False,
+        giveback_enabled=True,
+        trading_session=_session_config(),
+        kronos_provider=provider,
+        portfolio_max_positions=1,
+    )
+    engine.state.upsert_paper_position("SBER", 10, 0.1, (as_of - timedelta(hours=2)).isoformat(timespec="seconds"))
+    engine.state.save_position_giveback_state(
+        secid="SBER",
+        side="long",
+        entry_price=100.0,
+        mfe_pct=0.024,
+        last_pnl_pct=0.024,
+        opened_at=(as_of - timedelta(hours=2)).isoformat(timespec="seconds"),
+        updated_at=(as_of - timedelta(minutes=1)).isoformat(timespec="seconds"),
+    )
+    engine.market_data.snapshot_rows = {
+        **engine.market_data.snapshot_rows,
+        "SBER": MarketSnapshot("SBER", last_price=100.9, bid=100.8, ask=101.0),
+    }
+
+    result = engine.run_once(as_of)
+    payload = _decision_payload(engine, result.decision_id)
+
+    assert any(order.secid == "SBER" and order.request.get("reason") == "exit_pass" for order in result.orders)
+    assert provider.calls == 0
+    assert engine.state.load_position_giveback_state("SBER") is None
+    assert payload["exit_diagnostics"]["held"]["SBER"]["action_reason"] == "giveback_trailing"
+    assert payload["entry_diagnostics"]["reason"] == "entry_rebalance_wait"
+
+
+def test_entry_still_runs_on_rebalance_tick(tmp_path: Path):
+    as_of = datetime(2026, 6, 3, 12, 0)
+    provider = ForecastSignalProvider({"SBER": 0.006, "LKOH": 0.005})
+    engine = _engine(
+        tmp_path,
+        mode="paper",
+        scores={},
+        entry_mode="kronos_single_top",
+        trading_session=_session_config(),
+        kronos_provider=provider,
+        portfolio_max_positions=1,
+    )
+
+    result = engine.run_once(as_of)
+    payload = _decision_payload(engine, result.decision_id)
+
+    assert provider.calls == 1
+    assert any(order.request.get("order_kind") == "open" for order in result.orders)
+    assert payload["entry_diagnostics"]["action_reason"] == "single_top_entry"
 
 
 def test_held_strong_asset_can_receive_entry_topup(tmp_path: Path):
@@ -612,6 +876,35 @@ def test_kronos_single_top_does_not_backfill_rank_two_when_top_fails(tmp_path: P
     assert by_secid["VALID"]["reason"] == "not_top_1"
     assert payload["entry_diagnostics"]["target_action"] == "skip_flat"
     assert payload["entry_diagnostics"]["selected_count"] == 0
+
+
+def test_kronos_single_top_blocks_when_rank_gap_is_too_small(tmp_path: Path):
+    instruments = (Instrument("TOP"), Instrument("SECOND"))
+    engine = _engine(
+        tmp_path,
+        mode="paper",
+        scores={},
+        forecast_returns={"TOP": 0.0060, "SECOND": 0.0058},
+        instruments=instruments,
+        entry_mode="kronos_single_top",
+        exit_enabled=False,
+        portfolio_max_positions=1,
+        single_top_min_rank_gap=0.0004,
+    )
+
+    result = engine.run_once(datetime(2026, 6, 3, 12, 0))
+    payload = _decision_payload(engine, result.decision_id)
+    by_secid = {row["secid"]: row for row in payload["entry_ranked_candidates"]}
+
+    assert not result.orders
+    assert by_secid["TOP"]["rank"] == 1
+    assert by_secid["TOP"]["single_top_passed_filters"] is False
+    assert by_secid["TOP"]["reason"] == "single_top_rank_gap_below_min"
+    assert by_secid["TOP"]["top1_top2_gross_gap"] < 0.0004
+    assert by_secid["SECOND"]["reason"] == "not_top_1"
+    assert payload["entry_diagnostics"]["top1_passed_filters"] is False
+    assert payload["entry_diagnostics"]["top1_top2_gross_gap"] < 0.0004
+    assert payload["entry_diagnostics"]["action_reason"] == "single_top_rank_gap_below_min"
 
 
 def test_kronos_single_top_holds_same_instrument_and_side(tmp_path: Path):
@@ -1168,6 +1461,10 @@ def _engine(
     portfolio_max_positions: int = 2,
     entry_mode: str = "selectors",
     exit_enabled: bool = True,
+    edge_enabled: bool = True,
+    giveback_enabled: bool = False,
+    giveback_min_arm_profit: float = 0.012,
+    giveback_ratio: float = 0.60,
     slippage_spread_multiplier: float = 0.5,
     spread_pct_by_secid: dict[str, float] | None = None,
     exit_provider=None,
@@ -1176,6 +1473,7 @@ def _engine(
     particle_sample_count: int = 20,
     particle_ess_refresh_fraction: float = 0.25,
     single_top_min_net_edge: float = 0.0015,
+    single_top_min_rank_gap: float = 0.0,
     single_top_max_gross_pred_return: float = 0.0075,
     single_top_target_weight: float = 1.0,
     candles_by_secid: dict[str, pd.DataFrame] | None = None,
@@ -1215,6 +1513,10 @@ def _engine(
         trade_lifecycle=TradeLifecycleConfig(
             exit=TradeLifecycleExitConfig(
                 enabled=exit_enabled,
+                edge_enabled=edge_enabled,
+                giveback_enabled=giveback_enabled,
+                giveback_min_arm_profit=giveback_min_arm_profit,
+                giveback_ratio=giveback_ratio,
                 particle_enabled=particle_exit_enabled,
                 particle_horizon=particle_horizon,
                 particle_sample_count=particle_sample_count,
@@ -1223,6 +1525,7 @@ def _engine(
             entry=TradeLifecycleEntryConfig(
                 mode=entry_mode,
                 single_top_min_net_edge=single_top_min_net_edge,
+                single_top_min_rank_gap=single_top_min_rank_gap,
                 single_top_max_gross_pred_return=single_top_max_gross_pred_return,
                 single_top_target_weight=single_top_target_weight,
             ),
