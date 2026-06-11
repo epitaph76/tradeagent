@@ -21,6 +21,7 @@ from .meta_selector import train_daily_lightgbm
 from .moex_download import download_candles_for_instruments, download_futures_candles_for_roots
 from .runtime import RuntimeEngine
 from .storage import StateStore
+from .trading_calendar import sync_trading_sessions
 from .types import MarketMetrics, MarketSnapshot
 
 
@@ -56,6 +57,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--binance-interval", default="1h")
     p.add_argument("--timestamp-offset-hours", type=int, default=3)
 
+    p = sub.add_parser("sync-sessions")
+    p.add_argument("--config", default="configs/default.yaml")
+    p.add_argument("--from", dest="from_date", required=True)
+    p.add_argument("--till", dest="till_date", required=True)
+
     args = parser.parse_args(argv)
     if args.command == "run-once":
         return _run_once(args)
@@ -69,6 +75,8 @@ def main(argv: list[str] | None = None) -> int:
         return _historical_batch(args)
     if args.command == "download-candles":
         return _download_candles(args)
+    if args.command == "sync-sessions":
+        return _sync_sessions(args)
     raise AssertionError(args.command)
 
 
@@ -236,6 +244,20 @@ def _download_candles(args: argparse.Namespace) -> int:
         payload["rows"] = {**dict(payload["rows"]), "crypto": crypto_counts}
 
     print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+    return 0
+
+
+def _sync_sessions(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    state = StateStore(Path(config.data_dir) / "arena_state.sqlite3")
+    result = sync_trading_sessions(
+        config=config.trading_session,
+        state=state,
+        instruments=config.instruments,
+        from_dt=datetime.fromisoformat(str(args.from_date)),
+        till_dt=datetime.fromisoformat(str(args.till_date)),
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
     return 0
 
 

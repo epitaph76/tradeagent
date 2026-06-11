@@ -176,6 +176,8 @@ def _parse_instruments(raw: Any) -> tuple[Instrument, ...]:
                 enabled=bool(item.get("enabled", True)),
                 price_step=_optional_float(item.get("price_step")),
                 quote_currency=str(item.get("quote_currency", "RUB")),
+                venue=str(item["venue"]) if item.get("venue") is not None else None,
+                boardid=str(item["boardid"]) if item.get("boardid") is not None else None,
             )
         )
     return tuple(instruments)

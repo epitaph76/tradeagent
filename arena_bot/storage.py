@@ -4,7 +4,7 @@ import json
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 
 class StateStore:
@@ -116,6 +116,21 @@ class StateStore:
                     opened_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS trading_sessions (
+                    venue TEXT NOT NULL,
+                    secid TEXT NOT NULL,
+                    trade_date TEXT NOT NULL,
+                    session_type TEXT NOT NULL,
+                    time_from TEXT NOT NULL DEFAULT '',
+                    time_till TEXT NOT NULL DEFAULT '',
+                    is_traded INTEGER NOT NULL DEFAULT 0,
+                    boardid TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT '',
+                    source TEXT NOT NULL DEFAULT '',
+                    raw_json TEXT NOT NULL DEFAULT '{}',
+                    loaded_at TEXT NOT NULL,
+                    PRIMARY KEY(venue, secid, trade_date, session_type, time_from, time_till)
+                );
                 """
             )
 
@@ -182,6 +197,97 @@ class StateStore:
         with self.connect() as conn:
             conn.execute("DELETE FROM selector_returns")
             conn.execute("DELETE FROM market_features")
+
+    def save_trading_sessions(self, rows: Sequence[Mapping[str, Any]]) -> None:
+        if not rows:
+            return
+        loaded_at = _now()
+        with self.connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO trading_sessions(
+                    venue, secid, trade_date, session_type, time_from, time_till,
+                    is_traded, boardid, status, source, raw_json, loaded_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(venue, secid, trade_date, session_type, time_from, time_till) DO UPDATE SET
+                    is_traded=excluded.is_traded,
+                    boardid=excluded.boardid,
+                    status=excluded.status,
+                    source=excluded.source,
+                    raw_json=excluded.raw_json,
+                    loaded_at=excluded.loaded_at
+                """,
+                [
+                    (
+                        str(row.get("venue", "")),
+                        str(row.get("secid", "")),
+                        str(row.get("trade_date", "")),
+                        str(row.get("session_type", "")),
+                        str(row.get("time_from", "") or ""),
+                        str(row.get("time_till", "") or ""),
+                        1 if bool(row.get("is_traded", False)) else 0,
+                        str(row.get("boardid", "") or ""),
+                        str(row.get("status", "") or ""),
+                        str(row.get("source", "") or ""),
+                        _json(dict(row.get("raw") or row.get("raw_json") or {})),
+                        str(row.get("loaded_at") or loaded_at),
+                    )
+                    for row in rows
+                ],
+            )
+
+    def load_trading_sessions(
+        self,
+        *,
+        trade_date: str,
+        secids: Sequence[str] | None = None,
+        venues: Sequence[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        where = ["trade_date = ?"]
+        params: list[Any] = [str(trade_date)]
+        if secids:
+            placeholders = ",".join("?" for _ in secids)
+            where.append(f"secid IN ({placeholders})")
+            params.extend(str(secid) for secid in secids)
+        if venues:
+            placeholders = ",".join("?" for _ in venues)
+            where.append(f"venue IN ({placeholders})")
+            params.extend(str(venue) for venue in venues)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT venue, secid, trade_date, session_type, time_from, time_till,
+                       is_traded, boardid, status, source, raw_json, loaded_at
+                FROM trading_sessions
+                WHERE {' AND '.join(where)}
+                ORDER BY venue, secid, time_from, session_type
+                """,
+                params,
+            ).fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                raw = json.loads(row["raw_json"])
+            except Exception:
+                raw = {}
+            out.append(
+                {
+                    "venue": row["venue"],
+                    "secid": row["secid"],
+                    "trade_date": row["trade_date"],
+                    "session_type": row["session_type"],
+                    "time_from": row["time_from"],
+                    "time_till": row["time_till"],
+                    "is_traded": bool(row["is_traded"]),
+                    "boardid": row["boardid"],
+                    "status": row["status"],
+                    "source": row["source"],
+                    "raw": raw,
+                    "loaded_at": row["loaded_at"],
+                }
+            )
+        return out
 
     def save_kronos_forecasts(
         self,

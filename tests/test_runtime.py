@@ -204,7 +204,7 @@ def test_session_entry_cutoff_blocks_new_entries(tmp_path: Path):
     assert payload["entry_diagnostics"]["reason"] == "session_entry_cutoff"
 
 
-def test_session_force_flat_closes_equity_and_crypto(tmp_path: Path):
+def test_session_force_flat_closes_only_matching_venue(tmp_path: Path):
     as_of = datetime(2026, 6, 3, 18, 31)
     instruments = (Instrument("SBER", "equity"), Instrument("BTCUSDT", "crypto"))
     engine = _engine(
@@ -220,12 +220,13 @@ def test_session_force_flat_closes_equity_and_crypto(tmp_path: Path):
     result = engine.run_once(as_of)
     payload = _decision_payload(engine, result.decision_id)
 
-    assert {order.secid for order in result.orders} == {"SBER", "BTCUSDT"}
+    assert {order.secid for order in result.orders} == {"SBER"}
     assert all(order.request.get("reason") == "exit_pass" for order in result.orders)
     assert payload["session_state"] == "force_flat"
     assert payload["exit_diagnostics"]["held"]["SBER"]["action_reason"] == "session_force_flat"
-    assert payload["exit_diagnostics"]["held"]["BTCUSDT"]["action_reason"] == "session_force_flat"
-    assert engine.state.load_paper_positions() == {}
+    assert payload["exit_diagnostics"]["held"]["BTCUSDT"]["reason"] == "exit_forecast_missing"
+    positions = engine.state.load_paper_positions()
+    assert set(positions) == {"BTCUSDT"}
 
 
 def test_session_closed_does_not_call_kronos(tmp_path: Path):
@@ -246,6 +247,28 @@ def test_session_closed_does_not_call_kronos(tmp_path: Path):
     assert provider.calls == 0
     assert payload["session_state"] == "closed"
     assert payload["entry_diagnostics"]["reason"] == "session_closed"
+
+
+def test_closed_moex_session_does_not_block_crypto_entry(tmp_path: Path):
+    as_of = datetime(2026, 6, 3, 19, 0)
+    instruments = (Instrument("SBER", "equity"), Instrument("BTCUSDT", "crypto"))
+    engine = _engine(
+        tmp_path,
+        mode="paper",
+        scores={},
+        forecast_returns={"BTCUSDT": 0.05},
+        instruments=instruments,
+        entry_mode="kronos_rank",
+        trading_session=_session_config(),
+    )
+
+    result = engine.run_once(as_of)
+    payload = _decision_payload(engine, result.decision_id)
+
+    assert any(order.secid == "BTCUSDT" and order.request.get("reason") == "entry_pass" for order in result.orders)
+    assert "SBER" not in {row["secid"] for row in payload["entry_ranked_candidates"]}
+    assert payload["session"]["session_by_secid"]["SBER"]["session_state"] == "closed"
+    assert payload["session"]["session_by_secid"]["BTCUSDT"]["session_state"] == "trade"
 
 
 def test_session_blocks_entry_when_kronos_horizon_exceeds_cutoff(tmp_path: Path):

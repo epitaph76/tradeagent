@@ -22,6 +22,7 @@ from .portfolio import blend_selector_portfolios, prune_blended_weights
 from .selectors import build_selector_portfolio
 from .signals import EmptyKronosSignalProvider, MomentumSignalProvider, SignalProvider, latest_signal_scores, with_equity_kronos_fallback
 from .storage import StateStore
+from .trading_calendar import CacheFirstSessionCalendarProvider, SessionCalendarProvider
 from .types import AccountState, DecisionResult, Instrument, RuntimeConfig, SignalRow, TradingSessionConfig
 from .universe import select_universe
 
@@ -35,6 +36,7 @@ class RuntimeEngine:
         kronos_provider: SignalProvider | None = None,
         exit_kronos_provider: SignalProvider | None = None,
         momentum_provider: SignalProvider | None = None,
+        session_calendar: SessionCalendarProvider | None = None,
         state: StateStore | None = None,
         logger: JsonlLogger | None = None,
         arenago_client: ArenaGoClient | None = None,
@@ -44,6 +46,7 @@ class RuntimeEngine:
         data_dir = Path(config.data_dir)
         self.state = state or StateStore(data_dir / "arena_state.sqlite3")
         self.logger = logger or JsonlLogger(data_dir / "logs")
+        self.session_calendar = session_calendar or CacheFirstSessionCalendarProvider(config=config.trading_session, state=self.state)
         self.kronos_provider = kronos_provider or EmptyKronosSignalProvider()
         self.exit_kronos_provider = exit_kronos_provider or self._build_exit_kronos_provider()
         self.momentum_provider = momentum_provider or MomentumSignalProvider()
@@ -86,37 +89,14 @@ class RuntimeEngine:
     def run_once(self, as_of: datetime | None = None) -> DecisionResult:
         as_of = as_of or datetime.now()
         as_of_s = as_of.isoformat(timespec="seconds")
-        session = _trading_session_state(as_of, self.config.trading_session)
         snapshots = self.market_data.snapshots(as_of, self.config.instruments)
         candles = self.market_data.candles(as_of, self.config.instruments)
         metrics = self.market_data.metrics(as_of, self.config.instruments)
+        session = self.session_calendar.session_state(as_of, self.config.instruments, candles=candles)
         prices = {secid: snapshot.last_price for secid, snapshot in snapshots.items()}
         buy_prices, sell_prices = _execution_price_maps(snapshots)
         positions_before_exit = self.order_manager.current_positions()
         account_before = self._load_account_state(positions_before_exit, prices)
-        if bool(session.get("force_flat_required", False)):
-            return self._run_force_flat_session(
-                as_of=as_of,
-                as_of_s=as_of_s,
-                session=session,
-                snapshots=snapshots,
-                metrics=metrics,
-                candles=candles,
-                prices=prices,
-                buy_prices=buy_prices,
-                sell_prices=sell_prices,
-                positions_before_exit=positions_before_exit,
-                account_before=account_before,
-            )
-        if bool(session.get("enabled", False)) and str(session.get("session_state")) in {"pre_session", "warmup", "closed"}:
-            return self._run_session_idle(
-                as_of=as_of,
-                as_of_s=as_of_s,
-                session=session,
-                positions=positions_before_exit,
-                prices=prices,
-                account=account_before,
-            )
         exit_diagnostics, exit_scores = self._build_exit_plan(
             as_of=as_of,
             positions=positions_before_exit,
@@ -186,13 +166,15 @@ class RuntimeEngine:
         entry_rebalance_diagnostics: dict[str, Any] = {}
         horizon_diagnostics: dict[str, Any] = {}
         entry_recheck_diagnostics: dict[str, Any] = {}
+        session_filter_diagnostics: dict[str, Any] = {}
         selected: tuple[Instrument, ...] = tuple()
-        if not bool(session.get("entry_allowed", True)):
-            entry_block_reason = str(session.get("action_reason") or "session_entry_cutoff")
+        entry_candidates = _entry_allowed_instruments(self.config.instruments, session)
+        if not entry_candidates:
+            entry_block_reason = _session_entry_block_reason(session)
             universe_diagnostics = {"status": "session_skipped", "reason": entry_block_reason}
         else:
             universe = select_universe(
-                self.config.instruments,
+                entry_candidates,
                 snapshots=snapshots,
                 metrics=metrics,
                 max_equities=self.config.max_equities,
@@ -201,30 +183,19 @@ class RuntimeEngine:
             for secid, reason in universe.diagnostics.get("rejected", {}).items():
                 self.logger.write("instrument_untradable", {"as_of": as_of_s, "secid": secid, "reason": reason})
             selected = universe.instruments
-            horizon_ok, horizon_diagnostics = _kronos_horizon_check(
+            selected, session_filter_diagnostics = _filter_entry_instruments_for_session(
                 candles=candles,
                 instruments=selected,
                 as_of=as_of,
                 pred_len=max(int(self.config.kronos.pred_len), 1),
-                max_target_time=session.get("_kronos_cutoff_dt"),
+                decision_interval_minutes=int(self.config.rebalance.decision_interval_minutes),
+                session=session,
             )
-            if not horizon_ok:
-                entry_block_reason = "session_kronos_horizon_exceeds_close"
-            else:
-                recheck_ok, entry_recheck_diagnostics = _entry_recheck_window_check(
-                    as_of=as_of,
-                    decision_interval_minutes=int(self.config.rebalance.decision_interval_minutes),
-                    max_target_time=_entry_recheck_deadline(session),
-                )
-                if not recheck_ok:
-                    entry_block_reason = "session_kronos_recheck_window_too_short"
-                else:
-                    rebalance_ok, entry_rebalance_diagnostics = _entry_rebalance_tick_check(
-                        session=session,
-                        decision_interval_minutes=int(self.config.rebalance.decision_interval_minutes),
-                    )
-                    if not rebalance_ok:
-                        entry_block_reason = "entry_rebalance_wait"
+            horizon_diagnostics = dict(session_filter_diagnostics.get("kronos_horizon") or {})
+            entry_recheck_diagnostics = dict(session_filter_diagnostics.get("entry_recheck_window") or {})
+            entry_rebalance_diagnostics = dict(session_filter_diagnostics.get("entry_rebalance_tick") or {})
+            if not selected:
+                entry_block_reason = str(session_filter_diagnostics.get("primary_reason") or "session_no_entry_candidates")
 
         if entry_block_reason:
             target_weights = _position_weights(positions_after_risk, prices, self.instruments_by_secid, max(float(account_after_risk.equity), 1.0))
@@ -248,6 +219,8 @@ class RuntimeEngine:
                 meta_payload["entry_recheck_window"] = entry_recheck_diagnostics
             if entry_rebalance_diagnostics:
                 meta_payload["entry_rebalance_tick"] = entry_rebalance_diagnostics
+            if session_filter_diagnostics:
+                meta_payload["session_filter"] = session_filter_diagnostics
             entry_diagnostics = {
                 "status": "blocked",
                 "reason": entry_block_reason,
@@ -260,6 +233,8 @@ class RuntimeEngine:
                 entry_diagnostics["entry_recheck_window"] = entry_recheck_diagnostics
             if entry_rebalance_diagnostics:
                 entry_diagnostics["entry_rebalance_tick"] = entry_rebalance_diagnostics
+            if session_filter_diagnostics:
+                entry_diagnostics["session_filter"] = session_filter_diagnostics
             blend_diagnostics = {
                 "mode": "session_guard",
                 "reason": entry_block_reason,
@@ -793,19 +768,54 @@ class RuntimeEngine:
         if not held:
             diagnostics["status"] = "skipped_no_positions"
             return diagnostics, {}
-        if session is not None and not bool(session.get("exit_allowed", True)):
-            reason = str(session.get("action_reason") or "session_exit_blocked")
-            diagnostics["status"] = "session_blocked"
-            diagnostics["held"] = {instrument.secid: {"action": "hold", "action_reason": reason} for instrument in held}
-            return diagnostics, {}
 
         scores: dict[str, float] = {}
         close_secids: list[str] = []
-        remaining_held = list(held)
+        session_by_secid = _session_by_secid(session)
+        force_flat_secids = {
+            instrument.secid
+            for instrument in held
+            if bool(_instrument_session(session_by_secid, instrument.secid).get("force_flat_required", False))
+        }
+        for instrument in held:
+            if instrument.secid not in force_flat_secids:
+                continue
+            side = "long" if int(positions.get(instrument.secid, 0) or 0) > 0 else "short"
+            diagnostics["held"][instrument.secid] = {
+                "action": "close",
+                "action_reason": "session_force_flat",
+                "side": side,
+                "session": _session_public_payload(_instrument_session(session_by_secid, instrument.secid)),
+            }
+            scores[instrument.secid] = 1.0
+            close_secids.append(instrument.secid)
+        remaining_held = [instrument for instrument in held if instrument.secid not in force_flat_secids]
+        if not remaining_held:
+            diagnostics["status"] = "ready"
+            diagnostics["close_secids"] = close_secids
+            return diagnostics, scores
+
+        exitable: list[Instrument] = []
+        for instrument in remaining_held:
+            instrument_session = _instrument_session(session_by_secid, instrument.secid)
+            if instrument_session and not bool(instrument_session.get("exit_allowed", True)):
+                reason = str(instrument_session.get("action_reason") or "session_exit_blocked")
+                diagnostics["held"][instrument.secid] = {
+                    "action": "hold",
+                    "action_reason": reason,
+                    "session": _session_public_payload(instrument_session),
+                }
+                continue
+            exitable.append(instrument)
+        remaining_held = exitable
+        if not remaining_held:
+            diagnostics["status"] = "ready"
+            diagnostics["close_secids"] = close_secids
+            return diagnostics, scores
         if bool(getattr(lifecycle.exit, "giveback_enabled", False)):
             giveback_scores, giveback_close_secids = self._build_giveback_exit_plan(
                 as_of=as_of,
-                held=held,
+                held=remaining_held,
                 positions=positions,
                 snapshots=snapshots,
                 candles=candles,
@@ -814,7 +824,7 @@ class RuntimeEngine:
             scores.update(giveback_scores)
             close_secids.extend(giveback_close_secids)
             closed = set(giveback_close_secids)
-            remaining_held = [instrument for instrument in held if instrument.secid not in closed]
+            remaining_held = [instrument for instrument in remaining_held if instrument.secid not in closed]
             diagnostics["close_secids"] = list(close_secids)
         if not remaining_held:
             diagnostics["status"] = "ready"
@@ -844,11 +854,24 @@ class RuntimeEngine:
             diagnostics["close_secids"] = close_secids
             diagnostics["status"] = "ready"
             return diagnostics, scores
-        if session is not None and not bool(session.get("kronos_allowed", True)):
-            reason = str(session.get("action_reason") or "session_kronos_blocked")
-            diagnostics["status"] = "session_kronos_blocked"
-            for instrument in remaining_held:
-                diagnostics["held"].setdefault(instrument.secid, {"action": "hold", "action_reason": reason})
+        kronos_held: list[Instrument] = []
+        for instrument in remaining_held:
+            instrument_session = _instrument_session(session_by_secid, instrument.secid)
+            if instrument_session and not bool(instrument_session.get("kronos_allowed", True)):
+                reason = str(instrument_session.get("action_reason") or "session_kronos_blocked")
+                diagnostics["held"].setdefault(
+                    instrument.secid,
+                    {
+                        "action": "hold",
+                        "action_reason": reason,
+                        "session": _session_public_payload(instrument_session),
+                    },
+                )
+                continue
+            kronos_held.append(instrument)
+        remaining_held = kronos_held
+        if not remaining_held:
+            diagnostics["status"] = "ready"
             diagnostics["close_secids"] = close_secids
             return diagnostics, scores
 
@@ -993,9 +1016,7 @@ class RuntimeEngine:
     ) -> tuple[dict[str, Any], dict[str, float]]:
         lifecycle = self.config.trade_lifecycle
         diagnostics["particle_enabled"] = True
-        kronos_allowed = True if session is None else bool(session.get("kronos_allowed", True))
-        allow_new_trackers = True if session is None else bool(session.get("allow_new_trackers", True))
-        tracker_max_target_time = None if session is None else session.get("_force_flat_dt")
+        session_by_secid = _session_by_secid(session)
         held_secids = {instrument.secid for instrument in held}
         for secid in set(self.state.load_kronos_exit_trackers()) - held_secids:
             self.state.delete_kronos_exit_tracker(secid)
@@ -1008,6 +1029,10 @@ class RuntimeEngine:
             side = _tracker_side_for_lots(lots)
             if side is None:
                 continue
+            instrument_session = _instrument_session(session_by_secid, secid)
+            kronos_allowed = bool(instrument_session.get("kronos_allowed", True)) if instrument_session else True
+            allow_new_trackers = bool(instrument_session.get("allow_new_trackers", True)) if instrument_session else True
+            tracker_max_target_time = instrument_session.get("_force_flat_dt") if instrument_session else None
             tracker, tracker_diag = self._ensure_particle_tracker(
                 as_of=as_of,
                 instrument=instrument,
@@ -1463,9 +1488,7 @@ class RuntimeEngine:
         lifecycle = self.config.trade_lifecycle
         if not bool(getattr(lifecycle.exit, "particle_enabled", False)) or self.config.live_orders:
             return {}
-        allow_new_trackers = True if session is None else bool(session.get("allow_new_trackers", True))
-        allow_forecast = True if session is None else bool(session.get("kronos_allowed", True))
-        max_target_time = None if session is None else session.get("_force_flat_dt")
+        session_by_secid = _session_by_secid(session)
         created: list[str] = []
         deleted: list[str] = []
         for order, result in zip(planned, orders):
@@ -1480,6 +1503,10 @@ class RuntimeEngine:
             instrument = self.instruments_by_secid.get(secid)
             if side is None or instrument is None:
                 continue
+            instrument_session = _instrument_session(session_by_secid, secid)
+            allow_new_trackers = bool(instrument_session.get("allow_new_trackers", True)) if instrument_session else True
+            allow_forecast = bool(instrument_session.get("kronos_allowed", True)) if instrument_session else True
+            max_target_time = instrument_session.get("_force_flat_dt") if instrument_session else None
             existing = self.state.load_kronos_exit_tracker(secid)
             if existing is not None and existing.get("side") == side:
                 continue
@@ -2493,6 +2520,132 @@ def _is_incremental_entry_lots(current_lots: int, target_lots: int) -> bool:
 
 def _entry_mode(config: RuntimeConfig) -> str:
     return str(config.trade_lifecycle.entry.mode or "selectors").strip().lower()
+
+
+def _session_by_secid(session: Mapping[str, Any] | None) -> dict[str, Mapping[str, Any]]:
+    if session is None:
+        return {}
+    raw = session.get("_session_by_secid") or session.get("session_by_secid") or {}
+    if not isinstance(raw, Mapping):
+        return {}
+    return {str(secid): dict(value) for secid, value in raw.items() if isinstance(value, Mapping)}
+
+
+def _instrument_session(session_by_secid: Mapping[str, Mapping[str, Any]], secid: str) -> Mapping[str, Any]:
+    return session_by_secid.get(str(secid), {})
+
+
+def _entry_allowed_instruments(instruments: tuple[Instrument, ...], session: Mapping[str, Any] | None) -> tuple[Instrument, ...]:
+    session_by_secid = _session_by_secid(session)
+    if not session_by_secid:
+        return instruments
+    return tuple(
+        instrument
+        for instrument in instruments
+        if bool(_instrument_session(session_by_secid, instrument.secid).get("entry_allowed", True))
+    )
+
+
+def _session_entry_block_reason(session: Mapping[str, Any] | None) -> str:
+    session_by_secid = _session_by_secid(session)
+    reasons = [
+        str(row.get("action_reason") or "")
+        for row in session_by_secid.values()
+        if not bool(row.get("entry_allowed", True)) and str(row.get("action_reason") or "")
+    ]
+    if reasons:
+        return sorted(set(reasons))[0]
+    return str((session or {}).get("action_reason") or "session_entry_cutoff")
+
+
+def _filter_entry_instruments_for_session(
+    *,
+    candles: Mapping[str, Any],
+    instruments: tuple[Instrument, ...] | list[Instrument],
+    as_of: datetime,
+    pred_len: int,
+    decision_interval_minutes: int,
+    session: Mapping[str, Any] | None,
+) -> tuple[tuple[Instrument, ...], dict[str, Any]]:
+    session_by_secid = _session_by_secid(session)
+    if not session_by_secid:
+        return tuple(instruments), {"enabled": False}
+    kept: list[Instrument] = []
+    rejected: dict[str, str] = {}
+    by_secid: dict[str, Any] = {}
+    first_horizon: dict[str, Any] = {}
+    first_recheck: dict[str, Any] = {}
+    first_rebalance: dict[str, Any] = {}
+    for instrument in instruments:
+        secid = instrument.secid
+        instrument_session = _instrument_session(session_by_secid, secid)
+        if instrument_session and not bool(instrument_session.get("entry_allowed", True)):
+            reason = str(instrument_session.get("action_reason") or "session_entry_cutoff")
+            rejected[secid] = reason
+            by_secid[secid] = {"reason": reason, "session": _session_public_payload(instrument_session)}
+            continue
+        horizon_ok, horizon_diag = _kronos_horizon_check(
+            candles=candles,
+            instruments=[instrument],
+            as_of=as_of,
+            pred_len=max(int(pred_len), 1),
+            max_target_time=instrument_session.get("_kronos_cutoff_dt"),
+        )
+        if not horizon_ok:
+            reason = "session_kronos_horizon_exceeds_close"
+            rejected[secid] = reason
+            by_secid[secid] = {"reason": reason, "kronos_horizon": horizon_diag}
+            if not first_horizon:
+                first_horizon = horizon_diag
+            continue
+        recheck_ok, recheck_diag = _entry_recheck_window_check(
+            as_of=as_of,
+            decision_interval_minutes=int(decision_interval_minutes),
+            max_target_time=_entry_recheck_deadline(instrument_session),
+        )
+        if not recheck_ok:
+            reason = "session_kronos_recheck_window_too_short"
+            rejected[secid] = reason
+            by_secid[secid] = {"reason": reason, "entry_recheck_window": recheck_diag}
+            if not first_recheck:
+                first_recheck = recheck_diag
+            continue
+        rebalance_ok, rebalance_diag = _entry_rebalance_tick_check(
+            session=instrument_session,
+            decision_interval_minutes=int(decision_interval_minutes),
+        )
+        if not rebalance_ok:
+            reason = "entry_rebalance_wait"
+            rejected[secid] = reason
+            by_secid[secid] = {"reason": reason, "entry_rebalance_tick": rebalance_diag}
+            if not first_rebalance:
+                first_rebalance = rebalance_diag
+            continue
+        kept.append(instrument)
+        by_secid[secid] = {
+            "reason": "",
+            "kronos_horizon": horizon_diag,
+            "entry_recheck_window": recheck_diag,
+            "entry_rebalance_tick": rebalance_diag,
+        }
+    primary_reason = ""
+    if rejected and not kept:
+        primary_reason = next(iter(rejected.values()))
+    diagnostics: dict[str, Any] = {
+        "enabled": True,
+        "input_count": len(instruments),
+        "kept_secids": [instrument.secid for instrument in kept],
+        "rejected": rejected,
+        "by_secid": by_secid,
+        "primary_reason": primary_reason,
+    }
+    if first_horizon:
+        diagnostics["kronos_horizon"] = first_horizon
+    if first_recheck:
+        diagnostics["entry_recheck_window"] = first_recheck
+    if first_rebalance:
+        diagnostics["entry_rebalance_tick"] = first_rebalance
+    return tuple(kept), diagnostics
 
 
 def _trading_session_state(as_of: datetime, config: TradingSessionConfig) -> dict[str, Any]:

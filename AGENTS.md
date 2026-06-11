@@ -10,7 +10,7 @@ Tradeagent is a compact paper/live trading runtime for a 20-instrument universe.
 - Round-trip risk filtering for new entries.
 - Giveback trailing exits based on MFE inside the open position.
 - Optional particle-style Kronos path tracking for exits.
-- A Moscow trading-session guard that keeps the bot cash-flat near session close.
+- Venue-aware trading-session guards that force-flat only instruments whose venue session is closing.
 - A LightGBM meta-selector path that is still present and tested.
 - Saved-candle runtime backtests for the May 1-14 dataset.
 
@@ -39,7 +39,7 @@ The main May 1-14 config and `configs/default.yaml` currently use the `kronos_si
 1. Load market snapshots, candles, metrics, positions, and account state.
 2. Compute trading session state.
 3. If session is pre-open/closed, block trading and Kronos calls.
-4. If `force_flat`, close all positions and remove closed trackers.
+4. If any venue is in `force_flat`, close only positions for instruments in that venue/session and remove their closed trackers.
 5. Run exit logic first.
 6. Apply risk cap reductions if enabled.
 7. Build entry targets.
@@ -66,7 +66,7 @@ How replay works:
 - The config's `market_data.saved_candles.directories` selects the candle dataset.
 - `_replay_timestamps()` intersects timestamps across all configured instruments, then replays every common timestamp in the requested window.
 - If the dataset contains hourly candles, exits update hourly. If it contains `candles_1m_*` minute candles, exit/giveback can update every minute.
-- `runtime_backtest.py` also adds a synthetic `force_flat_time` tick, currently `18:30`, so positions can be flattened even when that exact candle timestamp is absent.
+- `runtime_backtest.py` adds synthetic force-flat ticks from the calendar/session layer, so positions can be flattened even when those exact candle timestamps are absent.
 - The backtest loads `base_config.data_dir/arena_state.sqlite3` into the run directory when it exists, then clears paper positions, orders, decisions, selector positions, account state, and giveback state. It intentionally preserves cached `kronos_forecasts`.
 - The runtime is forced to paper mode inside the run directory, so live orders are not sent.
 - The backtest applies dry-run/submitted orders to local cash/lots and writes account/trade exports.
@@ -153,16 +153,13 @@ Legacy edge exit still exists and compares directional `pred_return` against one
 
 ## Trading Session Rules
 
-Defaults are in `TradingSessionConfig`:
+Defaults are in `TradingSessionConfig`, with optional `session_templates` and a SQLite `trading_sessions` cache:
 
-- Timezone: `Europe/Moscow`.
-- Main session: `10:00-18:40`.
-- Entries start at `11:00`.
-- New entries stop at `17:40`.
-- Force-flat runs at `18:30`.
-- `flat_all_asset_classes=true`, so equities, futures, and crypto are all closed in the v1 MOEX-style session.
+- MOEX stock and futures use venue templates plus cached ISS calendar rows when available.
+- Binance spot is treated as 24/7, with live/cache status rows blocking symbols that are not `TRADING`.
+- Force-flat is scoped by `secid`; MOEX force-flat no longer closes crypto positions.
 
-Kronos forecasts and the next entry reassessment interval must fit inside session limits. Entry uses `kronos_cutoff`; particle exit clips to `force_flat_time`.
+Kronos forecasts and the next entry reassessment interval must fit inside each instrument's active session. Particle exits clip to that instrument's force-flat time.
 
 ## Commands
 

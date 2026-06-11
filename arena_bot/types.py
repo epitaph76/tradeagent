@@ -25,12 +25,28 @@ class Instrument:
     enabled: bool = True
     price_step: float | None = None
     quote_currency: str = "RUB"
+    venue: str | None = None
+    boardid: str | None = None
 
     def __post_init__(self) -> None:
         if self.asset_class not in {"equity", "future", "crypto"}:
             raise ValueError(f"unsupported asset_class: {self.asset_class}")
         if not self.secid:
             raise ValueError("instrument secid is required")
+        if self.venue is None:
+            venue = {
+                "equity": "moex_stock",
+                "future": "moex_futures",
+                "crypto": "binance_spot",
+            }[self.asset_class]
+            object.__setattr__(self, "venue", venue)
+        if self.boardid is None:
+            boardid = {
+                "equity": "TQBR",
+                "future": "RFUD",
+                "crypto": "",
+            }[self.asset_class]
+            object.__setattr__(self, "boardid", boardid)
 
 
 @dataclass(frozen=True)
@@ -105,6 +121,12 @@ class TradingSessionConfig:
     force_flat_time: str = "18:30"
     session_close: str = "18:40"
     flat_all_asset_classes: bool = True
+    calendar_cache_enabled: bool = True
+    calendar_cache_ttl_minutes: int = 1440
+    force_flat_minutes_before_close: int = 10
+    entry_warmup_minutes_after_open: int = 60
+    new_entry_cutoff_minutes_before_close: int = 60
+    session_templates: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

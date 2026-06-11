@@ -10,7 +10,7 @@ For coding agents, start with [AGENTS.md](AGENTS.md). It explains the current ar
 - `kronos_single_top` entry mode: hourly full-capital baseline that ranks the universe, trades only rank-1 if strict cost, gross-return, and top1/top2 gap filters pass, and blocks entries unless a full next Kronos reassessment interval remains.
 - Giveback trailing exits: open positions track MFE on every runtime tick; `run-live` ticks every minute while entries remain hourly.
 - Particle exit tracking: still implemented for configs that enable Kronos sample-path exits.
-- Session-safe trading: v1 uses a single `Europe/Moscow` window and forces all assets cash-flat near session close.
+- Session-safe trading: venue-aware calendar sessions with MOEX force-flat scoped to MOEX instruments and crypto kept 24/7 when Binance status is `TRADING`.
 - LightGBM meta-selector support: model loading/training code and latest compact model are kept in the repo.
 - Saved-candle backtests: the current May 1-14 dataset is included for reproducible runtime checks.
 
@@ -88,6 +88,6 @@ Runtime outputs, SQLite state, logs, and backtest exports are intentionally igno
 - The sign of `pred_return` selects side: positive is long, negative is short.
 - Only rank-1 can be traded. It must pass net-edge, top1/top2 gap, gross-prediction cap, session, sizing, and risk checks.
 - Giveback trailing tracks raw directional PnL per open position, updates MFE on every runtime tick, arms at `+1.2%`, and closes after `60%` giveback from MFE.
-- `force_flat_time: 18:30` closes remaining positions to cash.
+- Force-flat is venue-scoped: a MOEX close only closes MOEX instruments, while Binance spot remains eligible when its symbol status is `TRADING`.
 
 Kronos predicts `open/high/low/close/volume/amount`, but the current entry ranking uses only predicted close return. Other predicted candle fields are not yet part of ranking.

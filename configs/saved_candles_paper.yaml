@@ -17,7 +17,37 @@ trading_session:
   kronos_cutoff: "17:40"
   force_flat_time: "18:30"
   session_close: "18:40"
-  flat_all_asset_classes: true
+  flat_all_asset_classes: false
+  calendar_cache_enabled: true
+  calendar_cache_ttl_minutes: 1440
+  entry_warmup_minutes_after_open: 60
+  new_entry_cutoff_minutes_before_close: 60
+  force_flat_minutes_before_close: 10
+  session_templates:
+    moex_stock:
+      timezone: Europe/Moscow
+      sessions:
+        - type: main
+          open: "09:50"
+          close: "18:50"
+        - type: evening
+          open: "19:00"
+          close: "23:49:59"
+    moex_futures:
+      timezone: Europe/Moscow
+      sessions:
+        - type: day
+          open: "07:00"
+          close: "18:45"
+        - type: evening
+          open: "19:00"
+          close: "23:50"
+    binance_spot:
+      timezone: Europe/Moscow
+      sessions:
+        - type: crypto_24_7
+          open: "00:00"
+          close: "23:59:59"
 
 portfolio:
   max_positions: 8

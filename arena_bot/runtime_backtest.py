@@ -10,14 +10,18 @@ from datetime import datetime, time
 from pathlib import Path
 from typing import Mapping
 
+import pandas as pd
+
 from .accounting import account_to_payload, mark_account
 from .cli import _static_market_data_from_config
 from .config import load_config
 from .historical import _replay_timestamps
 from .kronos_provider import RealKronosSignalProvider
 from .logging import JsonlLogger
+from .market_data import SavedCandleMarketDataProvider
 from .runtime import RuntimeEngine
 from .storage import StateStore
+from .trading_calendar import session_force_flat_times
 from .types import Instrument, MarketSnapshot
 
 
@@ -65,10 +69,10 @@ def run(args: argparse.Namespace) -> None:
 
     config = replace(base_config, data_dir=str(run_dir), mode="paper")
     market_data = _static_market_data_from_config(config_path)
-    timestamps = _replay_timestamps(market_data, config.instruments, from_dt=from_dt, till_dt=till_dt)
+    timestamps = _runtime_replay_timestamps(market_data, config.instruments, from_dt=from_dt, till_dt=till_dt)
     if len(timestamps) < 2:
         raise RuntimeError("not enough timestamps")
-    decision_times = _runtime_decision_times(timestamps, config=config, from_dt=from_dt, till_dt=till_dt)
+    decision_times = _runtime_decision_times(timestamps, config=config, state=state, from_dt=from_dt, till_dt=till_dt)
     final_ts = timestamps[-1]
 
     engine = RuntimeEngine(
@@ -320,6 +324,7 @@ def _runtime_decision_times(
     timestamps: list[datetime],
     *,
     config: object,
+    state: StateStore | None = None,
     from_dt: datetime,
     till_dt: datetime,
 ) -> list[datetime]:
@@ -327,18 +332,37 @@ def _runtime_decision_times(
     session = getattr(config, "trading_session", None)
     if session is None or not bool(getattr(session, "enabled", False)):
         return decision_times
-    force_flat_raw = str(getattr(session, "force_flat_time", "") or "")
-    if not force_flat_raw:
-        return decision_times
-    force_flat = _parse_hhmm(force_flat_raw)
-    dates = sorted({ts.date() for ts in timestamps})
-    synthetic = [
-        datetime.combine(day, force_flat)
-        for day in dates
-        if from_dt <= datetime.combine(day, force_flat) <= till_dt
-        and timestamps[0] <= datetime.combine(day, force_flat) <= timestamps[-1]
-    ]
+    synthetic = session_force_flat_times(
+        config=session,
+        state=state,
+        instruments=tuple(getattr(config, "instruments", tuple())),
+        from_dt=from_dt,
+        till_dt=till_dt,
+    )
     return sorted(set(decision_times).union(synthetic))
+
+
+def _runtime_replay_timestamps(
+    market_data: object,
+    instruments: tuple[Instrument, ...] | list[Instrument],
+    *,
+    from_dt: datetime | None,
+    till_dt: datetime | None,
+) -> list[datetime]:
+    if not isinstance(market_data, SavedCandleMarketDataProvider):
+        return _replay_timestamps(market_data, instruments, from_dt=from_dt, till_dt=till_dt)  # type: ignore[arg-type]
+    values: set[pd.Timestamp] = set()
+    for instrument in instruments:
+        df = market_data._load(instrument.secid)
+        if df.empty or "timestamps" not in df.columns:
+            continue
+        values.update(pd.to_datetime(df["timestamps"], errors="coerce").dropna().dt.floor("s"))
+    out = [pd.Timestamp(ts).to_pydatetime() for ts in sorted(values)]
+    if from_dt is not None:
+        out = [ts for ts in out if ts >= from_dt]
+    if till_dt is not None:
+        out = [ts for ts in out if ts <= till_dt]
+    return out
 
 
 def _parse_hhmm(value: str) -> time:
