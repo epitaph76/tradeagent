@@ -47,6 +47,42 @@ The main May 1-14 config and `configs/default.yaml` currently use the `kronos_si
 9. Sync Kronos particle trackers after position changes.
 10. Persist a decision payload with diagnostics.
 
+`run-live` calls this cycle every `rebalance.exit_interval_minutes`, currently every minute. Entry logic is separately gated to `rebalance.decision_interval_minutes`, currently 60 minutes, so non-hourly runtime ticks can update exits and giveback without calling Kronos entry ranking.
+
+## Runtime Simulation / Backtest
+
+Use `arena_bot.runtime_backtest` for saved-candle simulations:
+
+```powershell
+python -m arena_bot.runtime_backtest `
+  --config configs/universe_v1_may1_14.yaml `
+  --from 2026-05-01T00:00:00 `
+  --till 2026-05-14T23:59:59 `
+  --run-dir data/universe-v1-may1-14/runtime-runs/manual
+```
+
+How replay works:
+
+- The config's `market_data.saved_candles.directories` selects the candle dataset.
+- `_replay_timestamps()` intersects timestamps across all configured instruments, then replays every common timestamp in the requested window.
+- If the dataset contains hourly candles, exits update hourly. If it contains `candles_1m_*` minute candles, exit/giveback can update every minute.
+- `runtime_backtest.py` also adds a synthetic `force_flat_time` tick, currently `18:30`, so positions can be flattened even when that exact candle timestamp is absent.
+- The backtest loads `base_config.data_dir/arena_state.sqlite3` into the run directory when it exists, then clears paper positions, orders, decisions, selector positions, account state, and giveback state. It intentionally preserves cached `kronos_forecasts`.
+- The runtime is forced to paper mode inside the run directory, so live orders are not sent.
+- The backtest applies dry-run/submitted orders to local cash/lots and writes account/trade exports.
+
+Backtest outputs:
+
+- `summary.json`: final liquidation equity, return, commissions, order counts, open positions.
+- `trades.csv`: every simulated order with side, qty, price, notional, commission, kind, reason, and cash after execution.
+- `account_curve.csv`: equity/cash/gross/net/positions after each runtime tick.
+- `ranked_top.jsonl`: per-candidate Kronos ranking rows from `entry_diagnostics.ranked_candidates`.
+- `risk_blocked_orders.jsonl`: orders rejected by leverage/cash/risk checks.
+- `arena_state.sqlite3`: copied SQLite state plus cached/generated Kronos forecasts for that run.
+- `logs/*.jsonl`: full decision payloads, including `exit_diagnostics`, `entry_diagnostics`, session state, and planned orders.
+
+For fair A/B comparisons, reuse the same Kronos forecast cache by pointing a test config's `data_dir` at the previous run directory before launching the new `--run-dir`. Fresh Kronos sampling is stochastic and can change top-1 candidates.
+
 ## Entry Logic
 
 The May 1-14 experiment config uses:
@@ -148,10 +184,27 @@ python -m arena_bot.runtime_backtest `
   --run-dir data/universe-v1-may1-14/runtime-runs/manual
 ```
 
+Run a comparable backtest while reusing an existing Kronos cache:
+
+```powershell
+# In the temporary config, set data_dir to the previous run directory first.
+python -m arena_bot.runtime_backtest `
+  --config data/universe-v1-may1-14/runtime-runs/manual/config_reuse_cache.yaml `
+  --from 2026-05-01T00:00:00 `
+  --till 2026-05-14T23:59:59 `
+  --run-dir data/universe-v1-may1-14/runtime-runs/manual_variant
+```
+
 Run one paper decision:
 
 ```powershell
 python -m arena_bot.cli run-once --config configs/universe_v1_may1_14.yaml --as-of 2026-05-04T11:00:00
+```
+
+Run the minute-tick paper/live loop:
+
+```powershell
+python -m arena_bot.cli run-live --config configs/default.yaml
 ```
 
 Train LightGBM from accumulated SQLite history:
