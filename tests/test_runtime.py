@@ -6,10 +6,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from arena_bot.logging import JsonlLogger
 from arena_bot.market_data import StaticMarketDataProvider
-from arena_bot.runtime import RuntimeEngine, _trading_session_state
+from arena_bot.runtime import RuntimeEngine, _kronos_entry_metrics_payload, _trading_session_state
 from arena_bot.signals import StaticSignalProvider
 from arena_bot.storage import StateStore
 from arena_bot.types import (
@@ -24,6 +25,7 @@ from arena_bot.types import (
     RiskConfig,
     RuntimeConfig,
     SignalRow,
+    TradeLifecycleEntryMetricsConfig,
     TradeLifecycleConfig,
     TradeLifecycleEntryConfig,
     TradeLifecycleExitConfig,
@@ -46,24 +48,31 @@ class FakeArenaClient:
 class ForecastSignalProvider:
     name = "kronos"
 
-    def __init__(self, returns: dict[str, float]):
+    def __init__(self, returns: dict[str, float], pred_ohlcv: dict[str, dict[str, float]] | None = None):
         self.returns = dict(returns)
+        self.pred_ohlcv = dict(pred_ohlcv or {})
         self.calls = 0
 
     def score(self, as_of, instruments, candles):
         self.calls += 1
-        return [
-            SignalRow(
-                as_of=as_of,
-                secid=instrument.secid,
-                signal_name="kronos",
-                bullish_score=0.75 if self.returns[instrument.secid] >= 0 else 0.25,
-                confidence=1.0,
-                metadata={"pred_return": self.returns[instrument.secid]},
+        rows = []
+        for instrument in instruments:
+            if instrument.secid not in self.returns:
+                continue
+            metadata = {"pred_return": self.returns[instrument.secid]}
+            if instrument.secid in self.pred_ohlcv:
+                metadata["pred_ohlcv"] = self.pred_ohlcv[instrument.secid]
+            rows.append(
+                SignalRow(
+                    as_of=as_of,
+                    secid=instrument.secid,
+                    signal_name="kronos",
+                    bullish_score=0.75 if self.returns[instrument.secid] >= 0 else 0.25,
+                    confidence=1.0,
+                    metadata=metadata,
+                )
             )
-            for instrument in instruments
-            if instrument.secid in self.returns
-        ]
+        return rows
 
 
 class ParticleForecastProvider:
@@ -152,6 +161,104 @@ def _candles(timestamps: list[datetime], closes: list[float], *, first_open: flo
 
 def _session_config() -> TradingSessionConfig:
     return TradingSessionConfig(enabled=True)
+
+
+def test_kronos_entry_metrics_formula_for_long_candidate():
+    row = SignalRow(
+        as_of=datetime(2026, 6, 3, 12, 0),
+        secid="LONG",
+        signal_name="kronos",
+        bullish_score=0.75,
+        metadata={"pred_return": 0.02, "pred_ohlcv": {"open": 100.0, "high": 103.0, "low": 99.0, "close": 102.0}},
+    )
+
+    payload = _kronos_entry_metrics_payload(
+        secid="LONG",
+        side="long",
+        row=row,
+        snapshot=MarketSnapshot("LONG", last_price=100.0, bid=100.0, ask=100.0),
+        metric=MarketMetrics("LONG", realized_volatility=0.01),
+        price=100.0,
+        costs={"spread_pct": 0.0, "round_trip_cost": 0.0},
+        config=TradeLifecycleEntryMetricsConfig(),
+        session_filter_diagnostics={"by_secid": {"LONG": {"entry_recheck_window": {"remaining_minutes": 60.0}}}},
+    )
+
+    assert payload["kronos_metrics_status"] == "ok"
+    assert payload["raw_edge_bps"] == pytest.approx(200.0)
+    assert payload["net_edge_bps"] == pytest.approx(200.0)
+    assert payload["pred_mfe_bps"] == pytest.approx(300.0)
+    assert payload["pred_mae_bps"] == pytest.approx(100.0)
+    assert payload["pred_rr"] == pytest.approx(3.0)
+    assert payload["positive_metrics"]["net_edge_score"] == pytest.approx(1.0)
+    assert payload["positive_metrics"]["edge_z_score"] == pytest.approx(1.0)
+    assert payload["positive_metrics"]["rr_score"] == pytest.approx(1.0)
+    assert payload["positive_metrics"]["mae_score"] == pytest.approx(1.0 / 6.0)
+    assert payload["positive_metrics"]["close_score"] == pytest.approx(0.5)
+    assert payload["positive_metrics"]["body_score"] == pytest.approx(0.8)
+    assert payload["positive_metrics"]["wick_score"] == pytest.approx(1.0 - 0.25 / 0.70)
+    assert payload["positive_metrics"]["candle_quality"] == pytest.approx(0.5 * 0.8 * (1.0 - 0.25 / 0.70))
+    assert payload["positive_metrics"]["edge_risk_quality"] == pytest.approx(1.0 / 6.0)
+    assert payload["risk_metrics"]["false_breakout_risk"] == pytest.approx(0.125)
+    assert payload["risk_metrics"]["wide_spread_risk"] == pytest.approx(0.0)
+    assert payload["risk_metrics"]["late_entry_risk"] == pytest.approx(0.5)
+    assert payload["risk_metrics"]["high_mae_risk"] == pytest.approx(5.0 / 6.0)
+    assert payload["risk_metrics"]["direction_conflict_risk"] == pytest.approx(0.0)
+
+
+def test_kronos_entry_metrics_formula_for_short_candidate():
+    row = SignalRow(
+        as_of=datetime(2026, 6, 3, 12, 0),
+        secid="SHORT",
+        signal_name="kronos",
+        bullish_score=0.25,
+        metadata={"pred_return": -0.02, "pred_ohlcv": {"open": 100.0, "high": 101.0, "low": 97.0, "close": 98.0}},
+    )
+
+    payload = _kronos_entry_metrics_payload(
+        secid="SHORT",
+        side="short",
+        row=row,
+        snapshot=MarketSnapshot("SHORT", last_price=100.0, bid=100.0, ask=100.0),
+        metric=MarketMetrics("SHORT", realized_volatility=0.01),
+        price=100.0,
+        costs={"spread_pct": 0.0, "round_trip_cost": 0.0},
+        config=TradeLifecycleEntryMetricsConfig(),
+    )
+
+    assert payload["kronos_metrics_status"] == "ok"
+    assert payload["raw_edge_bps"] == pytest.approx(200.0)
+    assert payload["pred_mfe_bps"] == pytest.approx(300.0)
+    assert payload["pred_mae_bps"] == pytest.approx(100.0)
+    assert payload["positive_metrics"]["close_score"] == pytest.approx(0.5)
+    assert payload["positive_metrics"]["body_score"] == pytest.approx(0.8)
+    assert payload["positive_metrics"]["wick_score"] == pytest.approx(1.0 - 0.25 / 0.70)
+    assert payload["risk_metrics"]["false_breakout_risk"] == pytest.approx(0.125)
+    assert payload["risk_metrics"]["direction_conflict_risk"] == pytest.approx(0.0)
+
+
+def test_kronos_entry_metrics_flags_direction_conflict():
+    row = SignalRow(
+        as_of=datetime(2026, 6, 3, 12, 0),
+        secid="SHORT",
+        signal_name="kronos",
+        bullish_score=0.25,
+        metadata={"pred_return": -0.01, "pred_ohlcv": {"open": 102.0, "high": 103.0, "low": 99.0, "close": 101.0}},
+    )
+
+    payload = _kronos_entry_metrics_payload(
+        secid="SHORT",
+        side="short",
+        row=row,
+        snapshot=MarketSnapshot("SHORT", last_price=100.0, bid=100.0, ask=100.0),
+        metric=MarketMetrics("SHORT", realized_volatility=0.01),
+        price=100.0,
+        costs={"spread_pct": 0.0, "round_trip_cost": 0.0},
+        config=TradeLifecycleEntryMetricsConfig(),
+    )
+
+    assert payload["risk_metrics"]["direction_conflict_risk"] == pytest.approx(1.0)
+    assert payload["positive_metrics"]["body_score"] == pytest.approx(0.0)
 
 
 def test_trading_session_state_boundaries():
@@ -732,6 +839,37 @@ def test_kronos_rank_maps_return_sign_to_entry_side(tmp_path: Path):
     assert any(order.secid == "SHORT" and order.direction == "S" for order in result.orders)
 
 
+def test_kronos_rank_attaches_entry_metrics(tmp_path: Path):
+    provider = ForecastSignalProvider(
+        {"SBER": 0.006, "LKOH": -0.005},
+        pred_ohlcv={
+            "SBER": {"open": 100.0, "high": 101.0, "low": 99.5, "close": 100.6},
+            "LKOH": {"open": 100.0, "high": 100.5, "low": 99.0, "close": 99.5},
+        },
+    )
+    engine = _engine(
+        tmp_path,
+        mode="paper",
+        scores={},
+        instruments=(Instrument("SBER"), Instrument("LKOH")),
+        entry_mode="kronos_rank",
+        exit_enabled=False,
+        portfolio_max_positions=5,
+        kronos_provider=provider,
+    )
+
+    result = engine.run_once(datetime(2026, 6, 3, 12, 0))
+    payload = _decision_payload(engine, result.decision_id)
+    by_secid = {row["secid"]: row for row in payload["entry_ranked_candidates"]}
+
+    assert by_secid["SBER"]["kronos_metrics_status"] == "ok"
+    assert by_secid["SBER"]["positive_metrics"]["net_edge_score"] >= 0.0
+    assert by_secid["SBER"]["risk_metrics"]["wide_spread_risk"] > 0.0
+    assert by_secid["LKOH"]["kronos_metrics_status"] == "ok"
+    assert by_secid["LKOH"]["positive_metrics"]["close_score"] >= 0.0
+    assert payload["entry_diagnostics"]["ranking_mode"] == "kronos_rank"
+
+
 def test_kronos_rank_sorts_by_abs_edge_not_bullish_score(tmp_path: Path):
     instruments = (Instrument("SMALL_LONG"), Instrument("BIG_SHORT"), Instrument("MID_LONG"))
     engine = _engine(
@@ -872,6 +1010,61 @@ def test_kronos_single_top_opens_only_rank_one_when_filters_pass(tmp_path: Path)
     assert by_secid["SECOND"]["reason"] == "not_top_1"
     assert payload["entry_diagnostics"]["ranking_mode"] == "kronos_single_top"
     assert payload["entry_diagnostics"]["target_action"] == "open"
+
+
+def test_kronos_single_top_attaches_entry_metrics(tmp_path: Path):
+    instruments = (Instrument("TOP"), Instrument("SECOND"))
+    provider = ForecastSignalProvider(
+        {"TOP": 0.006, "SECOND": -0.005},
+        pred_ohlcv={
+            "TOP": {"open": 100.0, "high": 101.0, "low": 99.5, "close": 100.6},
+            "SECOND": {"open": 100.0, "high": 100.5, "low": 99.0, "close": 99.5},
+        },
+    )
+    engine = _engine(
+        tmp_path,
+        mode="paper",
+        scores={},
+        instruments=instruments,
+        entry_mode="kronos_single_top",
+        exit_enabled=False,
+        portfolio_max_positions=1,
+        kronos_provider=provider,
+    )
+
+    result = engine.run_once(datetime(2026, 6, 3, 12, 0))
+    payload = _decision_payload(engine, result.decision_id)
+    top = {row["secid"]: row for row in payload["entry_ranked_candidates"]}["TOP"]
+
+    assert top["kronos_metrics_status"] == "ok"
+    assert top["pred_open"] == pytest.approx(100.0)
+    assert top["spread_bps"] > 0
+    assert top["roundtrip_cost_bps"] > 0
+    assert "net_edge_score" in top["positive_metrics"]
+    assert "direction_conflict_risk" in top["risk_metrics"]
+    assert payload["entry_diagnostics"]["ranking_metric"] == "gross_pred_return"
+
+
+def test_kronos_entry_metrics_missing_pred_ohlcv_does_not_change_single_top_entry(tmp_path: Path):
+    engine = _engine(
+        tmp_path,
+        mode="paper",
+        scores={},
+        forecast_returns={"SBER": 0.006},
+        entry_mode="kronos_single_top",
+        exit_enabled=False,
+        portfolio_max_positions=1,
+    )
+
+    result = engine.run_once(datetime(2026, 6, 3, 12, 0))
+    payload = _decision_payload(engine, result.decision_id)
+    row = payload["entry_ranked_candidates"][0]
+
+    assert result.orders
+    assert row["secid"] == "SBER"
+    assert row["reason"] == "single_top_entry"
+    assert row["kronos_metrics_status"] == "missing_pred_ohlcv"
+    assert "positive_metrics" not in row
 
 
 def test_kronos_single_top_does_not_backfill_rank_two_when_top_fails(tmp_path: Path):

@@ -7,6 +7,7 @@ import time
 from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Mapping
 
 import pandas as pd
 
@@ -16,7 +17,7 @@ from .crypto_download import download_binance_klines_for_symbols
 from .historical import run_historical_batch
 from .kronos_provider import RealKronosSignalProvider
 from .logging import JsonlLogger
-from .market_data import SavedCandleMarketDataProvider, StaticMarketDataProvider
+from .market_data import AlgoPackRealtimeMarketDataProvider, BinanceRealtimeMarketDataProvider, MarketDataProvider, SavedCandleMarketDataProvider, StaticMarketDataProvider
 from .meta_selector import train_daily_lightgbm
 from .moex_download import download_candles_for_instruments, download_futures_candles_for_roots
 from .runtime import RuntimeEngine
@@ -262,11 +263,12 @@ def _sync_sessions(args: argparse.Namespace) -> int:
 
 
 def _build_engine(config_path: str) -> RuntimeEngine:
+    _load_local_env(config_path)
     config = load_config(config_path)
     data_dir = Path(config.data_dir)
     state = StateStore(data_dir / "arena_state.sqlite3")
     logger = JsonlLogger(data_dir / "logs")
-    market_data = _static_market_data_from_config(config_path)
+    market_data = _static_market_data_from_config(config_path, enable_realtime_overlays=True)
     kronos_provider = None
     if config.kronos.enabled:
         kronos_provider = RealKronosSignalProvider(config=config.kronos, state=state)
@@ -286,7 +288,7 @@ def _build_engine(config_path: str) -> RuntimeEngine:
     )
 
 
-def _static_market_data_from_config(config_path: str) -> StaticMarketDataProvider:
+def _static_market_data_from_config(config_path: str, *, enable_realtime_overlays: bool = False) -> MarketDataProvider:
     import yaml
 
     path = Path(config_path)
@@ -294,11 +296,12 @@ def _static_market_data_from_config(config_path: str) -> StaticMarketDataProvide
     raw_market = raw.get("market_data", {}) if isinstance(raw, dict) else {}
     saved = raw_market.get("saved_candles") or {}
     if saved.get("directories"):
-        return SavedCandleMarketDataProvider(
+        provider: MarketDataProvider = SavedCandleMarketDataProvider(
             directories=[str(path) for path in saved.get("directories")],
             filename_patterns=tuple(saved.get("filename_patterns") or ("candles_{secid}.csv", "candles_1m_{secid}.csv")),
             history_rows=int(saved.get("history_rows", 512)),
         )
+        return _with_realtime_market_data(provider, raw_market) if enable_realtime_overlays else provider
     snapshots = {
         secid: MarketSnapshot(
             secid=secid,
@@ -325,7 +328,62 @@ def _static_market_data_from_config(config_path: str) -> StaticMarketDataProvide
     candles = {}
     for secid, rows in (raw_market.get("candles") or {}).items():
         candles[secid] = pd.DataFrame(rows)
-    return StaticMarketDataProvider(snapshot_rows=snapshots, metric_rows=metrics, candle_rows=candles)
+    provider = StaticMarketDataProvider(snapshot_rows=snapshots, metric_rows=metrics, candle_rows=candles)
+    return _with_realtime_market_data(provider, raw_market) if enable_realtime_overlays else provider
+
+
+def _with_realtime_market_data(provider: MarketDataProvider, raw_market: Mapping[str, object]) -> MarketDataProvider:
+    provider = _with_algopack_realtime_market_data(provider, raw_market)
+    return _with_binance_realtime_market_data(provider, raw_market)
+
+
+def _with_algopack_realtime_market_data(provider: MarketDataProvider, raw_market: Mapping[str, object]) -> MarketDataProvider:
+    raw_algopack = raw_market.get("algopack") if isinstance(raw_market, Mapping) else None
+    algopack = raw_algopack if isinstance(raw_algopack, Mapping) else {}
+    if not bool(algopack.get("enabled", True)):
+        return provider
+    token_env = str(algopack.get("token_env", "MOEX_ALGOPACK_TOKEN"))
+    token = os.environ.get(token_env, "")
+    if not token:
+        return provider
+    return AlgoPackRealtimeMarketDataProvider(
+        fallback=provider,
+        token=token,
+        base_url=str(algopack.get("base_url", "https://apim.moex.com")),
+        timeout=float(algopack.get("timeout", 10.0)),
+        retries=int(algopack.get("retries", 2)),
+    )
+
+
+def _with_binance_realtime_market_data(provider: MarketDataProvider, raw_market: Mapping[str, object]) -> MarketDataProvider:
+    raw_binance = raw_market.get("binance") if isinstance(raw_market, Mapping) else None
+    binance = raw_binance if isinstance(raw_binance, Mapping) else {}
+    if not bool(binance.get("enabled", True)):
+        return provider
+    return BinanceRealtimeMarketDataProvider(
+        fallback=provider,
+        base_url=str(binance.get("base_url", "https://api.binance.com")),
+        timeout=float(binance.get("timeout", 10.0)),
+        retries=int(binance.get("retries", 2)),
+    )
+
+
+def _load_local_env(config_path: str) -> None:
+    candidates = [
+        Path.cwd() / ".env",
+        Path(config_path).resolve().parent.parent / ".env",
+    ]
+    for path in candidates:
+        if not path.exists():
+            continue
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if key and key not in os.environ:
+                os.environ[key] = value.strip().strip('"').strip("'")
 
 
 def _parse_as_of(value: str) -> datetime | None:

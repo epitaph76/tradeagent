@@ -23,7 +23,7 @@ from .selectors import build_selector_portfolio
 from .signals import EmptyKronosSignalProvider, MomentumSignalProvider, SignalProvider, latest_signal_scores, with_equity_kronos_fallback
 from .storage import StateStore
 from .trading_calendar import CacheFirstSessionCalendarProvider, SessionCalendarProvider
-from .types import AccountState, DecisionResult, Instrument, RuntimeConfig, SignalRow, TradingSessionConfig
+from .types import AccountState, DecisionResult, Instrument, RuntimeConfig, SignalRow, TradeLifecycleEntryMetricsConfig, TradingSessionConfig
 from .universe import select_universe
 
 
@@ -271,6 +271,7 @@ class RuntimeEngine:
                     metrics=metrics,
                     signals=signals,
                     blocked_secids=exit_close_secids,
+                    session_filter_diagnostics=session_filter_diagnostics,
                 )
                 blend_diagnostics = {
                     "mode": "bypassed_kronos_rank",
@@ -307,6 +308,7 @@ class RuntimeEngine:
                     metrics=metrics,
                     signals=signals,
                     blocked_secids=exit_close_secids,
+                    session_filter_diagnostics=session_filter_diagnostics,
                 )
                 blend_diagnostics = {
                     "mode": "bypassed_kronos_single_top",
@@ -1647,6 +1649,7 @@ class RuntimeEngine:
         metrics: Mapping[str, Any],
         signals: tuple[SignalRow, ...],
         blocked_secids: set[str],
+        session_filter_diagnostics: Mapping[str, Any] | None = None,
     ) -> tuple[dict[str, float], dict[str, Any]]:
         lifecycle = self.config.trade_lifecycle
         equity = max(float(account.equity), 1.0)
@@ -1663,7 +1666,8 @@ class RuntimeEngine:
         for instrument in instruments:
             secid = instrument.secid
             current_lots = int(positions.get(secid, 0) or 0)
-            pred_return = _signal_pred_return(rows_by_secid.get(secid))
+            signal_row = rows_by_secid.get(secid)
+            pred_return = _signal_pred_return(signal_row)
             held = current_lots != 0
             base_item: dict[str, Any] = {
                 "rank": None,
@@ -1707,6 +1711,19 @@ class RuntimeEngine:
                     "side": "long" if side > 0 else "short",
                     **costs,
                 }
+            )
+            base_item.update(
+                _kronos_entry_metrics_payload(
+                    secid=secid,
+                    side=str(base_item["side"]),
+                    row=signal_row,
+                    snapshot=snapshots.get(secid),
+                    metric=metrics.get(secid),
+                    price=float(prices.get(secid, 0.0) or 0.0),
+                    costs=costs,
+                    config=lifecycle.entry.metrics,
+                    session_filter_diagnostics=session_filter_diagnostics,
+                )
             )
             ranked.append(base_item)
 
@@ -1825,6 +1842,7 @@ class RuntimeEngine:
         metrics: Mapping[str, Any],
         signals: tuple[SignalRow, ...],
         blocked_secids: set[str] | None = None,
+        session_filter_diagnostics: Mapping[str, Any] | None = None,
     ) -> tuple[dict[str, float], dict[str, Any]]:
         lifecycle = self.config.trade_lifecycle
         entry = lifecycle.entry
@@ -1844,7 +1862,8 @@ class RuntimeEngine:
             secid = instrument.secid
             current_lots = int(positions.get(secid, 0) or 0)
             current_side = _position_side(current_lots)
-            pred_return = _signal_pred_return(rows_by_secid.get(secid))
+            signal_row = rows_by_secid.get(secid)
+            pred_return = _signal_pred_return(signal_row)
             item: dict[str, Any] = {
                 "rank": None,
                 "secid": secid,
@@ -1884,6 +1903,19 @@ class RuntimeEngine:
                 item["reason"] = "zero_pred_return"
                 skipped.append(item)
                 continue
+            item.update(
+                _kronos_entry_metrics_payload(
+                    secid=secid,
+                    side=str(item["side"]),
+                    row=signal_row,
+                    snapshot=snapshots.get(secid),
+                    metric=metrics.get(secid),
+                    price=float(prices.get(secid, 0.0) or 0.0),
+                    costs=costs,
+                    config=entry.metrics,
+                    session_filter_diagnostics=session_filter_diagnostics,
+                )
+            )
             item["same_as_current_position"] = current_side == side and current_lots != 0
             filter_reason = _single_top_filter_reason(
                 gross_pred_return=gross_pred_return,
@@ -2128,6 +2160,245 @@ def _signal_pred_return(row: SignalRow | None) -> float | None:
     except Exception:
         return None
     return out if math.isfinite(out) else None
+
+
+def _kronos_entry_metrics_payload(
+    *,
+    secid: str,
+    side: str | None,
+    row: SignalRow | None,
+    snapshot: Any,
+    metric: Any,
+    price: float,
+    costs: Mapping[str, Any],
+    config: TradeLifecycleEntryMetricsConfig,
+    session_filter_diagnostics: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not bool(getattr(config, "enabled", True)):
+        return {"kronos_metrics_status": "disabled"}
+
+    pred = _signal_pred_ohlcv(row)
+    if pred is None:
+        return {"kronos_metrics_status": "missing_pred_ohlcv"}
+
+    payload: dict[str, Any] = {
+        "kronos_metrics_status": "ok",
+        "pred_open": pred["open"],
+        "pred_high": pred["high"],
+        "pred_low": pred["low"],
+        "pred_close": pred["close"],
+    }
+    if side not in {"long", "short"}:
+        payload["kronos_metrics_status"] = "missing_side"
+        return payload
+
+    market = _kronos_entry_market_prices(snapshot=snapshot, price=price, costs=costs)
+    if market is None:
+        payload["kronos_metrics_status"] = "missing_market_price"
+        return payload
+
+    o = pred["open"]
+    h = pred["high"]
+    l = pred["low"]
+    c = pred["close"]
+    bid = market["bid"]
+    ask = market["ask"]
+    mid = market["mid"]
+    eps = max(_metrics_config_float(config, "eps", 1e-12), 1e-12)
+
+    pred_range = max(h - l, eps)
+    spread_bps = ((ask - bid) / mid) * 10000.0 if mid > 0 else 0.0
+    roundtrip_cost_bps = _non_negative_float(costs.get("round_trip_cost"), default=0.0) * 10000.0
+    realized_vol_1h_bps = _non_negative_float(getattr(metric, "realized_volatility", 0.0), default=0.0) * 10000.0
+    minutes_to_kronos_cutoff = _kronos_metrics_remaining_minutes(secid, session_filter_diagnostics)
+
+    if side == "long":
+        raw_edge_bps = ((c - ask) / ask) * 10000.0
+        pred_mfe_bps = ((h - ask) / ask) * 10000.0
+        pred_mae_bps = ((ask - l) / ask) * 10000.0
+        close_quality = (c - l) / pred_range
+    else:
+        raw_edge_bps = ((bid - c) / bid) * 10000.0
+        pred_mfe_bps = ((bid - l) / bid) * 10000.0
+        pred_mae_bps = ((h - bid) / bid) * 10000.0
+        close_quality = 1.0 - ((c - l) / pred_range)
+
+    net_edge_bps = raw_edge_bps - roundtrip_cost_bps
+    pred_rr = pred_mfe_bps / max(pred_mae_bps, eps)
+    net_edge_score = _clip01((net_edge_bps - _metrics_config_float(config, "min_edge_bps", 10.0)) / max(_metrics_config_float(config, "edge_scale_bps", 70.0), eps))
+    edge_z = net_edge_bps / max(realized_vol_1h_bps, _metrics_config_float(config, "vol_floor_bps", 10.0), eps)
+    edge_z_score = _clip01((edge_z - 0.3) / (1.5 - 0.3))
+    rr_score = _clip01((pred_rr - 1.0) / (2.5 - 1.0))
+    max_allowed_mae_bps = max(50.0, 1.2 * realized_vol_1h_bps)
+    mae_score = 1.0 - _clip01(pred_mae_bps / max(max_allowed_mae_bps, eps))
+    close_score = _clip01((close_quality - 0.5) / 0.5)
+
+    body_ratio = abs(c - o) / pred_range
+    body_score = _clip01((body_ratio - 0.10) / (0.60 - 0.10))
+    if side == "long":
+        if c <= o:
+            body_score *= 0.5
+        if c <= mid:
+            body_score = 0.0
+    else:
+        if c >= o:
+            body_score *= 0.5
+        if c >= mid:
+            body_score = 0.0
+
+    upper_wick = max(h - max(o, c), 0.0)
+    lower_wick = max(min(o, c) - l, 0.0)
+    upper_wick_ratio = upper_wick / pred_range
+    lower_wick_ratio = lower_wick / pred_range
+    bad_wick_ratio = upper_wick_ratio if side == "long" else lower_wick_ratio
+    wick_score = 1.0 - _clip01(bad_wick_ratio / 0.70)
+    candle_quality = close_score * body_score * wick_score
+    edge_risk_quality = net_edge_score * rr_score * mae_score
+
+    false_breakout_risk = _clip01(bad_wick_ratio * (1.0 - close_score))
+    wide_spread_risk = _clip01(spread_bps / max(_metrics_config_float(config, "max_allowed_spread_bps", 20.0), eps))
+    required_recheck_minutes = max(_metrics_config_float(config, "required_recheck_minutes", 120.0), eps)
+    late_entry_risk = 0.0 if minutes_to_kronos_cutoff is None else _clip01((required_recheck_minutes - minutes_to_kronos_cutoff) / required_recheck_minutes)
+    high_mae_risk = 1.0 - mae_score
+    if side == "long":
+        if c > o and c > mid:
+            direction_conflict_risk = 0.0
+        elif c > mid and c <= o:
+            direction_conflict_risk = 0.5
+        else:
+            direction_conflict_risk = 1.0
+    else:
+        if c < o and c < mid:
+            direction_conflict_risk = 0.0
+        elif c < mid and c >= o:
+            direction_conflict_risk = 0.5
+        else:
+            direction_conflict_risk = 1.0
+
+    positive_metrics = {
+        "net_edge_score": net_edge_score,
+        "edge_z_score": edge_z_score,
+        "rr_score": rr_score,
+        "mae_score": mae_score,
+        "close_score": close_score,
+        "body_score": body_score,
+        "wick_score": wick_score,
+        "candle_quality": candle_quality,
+        "edge_risk_quality": edge_risk_quality,
+    }
+    risk_metrics = {
+        "false_breakout_risk": false_breakout_risk,
+        "wide_spread_risk": wide_spread_risk,
+        "late_entry_risk": late_entry_risk,
+        "high_mae_risk": high_mae_risk,
+        "direction_conflict_risk": direction_conflict_risk,
+    }
+    payload.update(
+        {
+            "market_price_source": market["source"],
+            "current_bid": bid,
+            "current_ask": ask,
+            "current_mid": mid,
+            "pred_range": pred_range,
+            "spread_bps": spread_bps,
+            "roundtrip_cost_bps": roundtrip_cost_bps,
+            "raw_edge_bps": raw_edge_bps,
+            "net_edge_bps": net_edge_bps,
+            "pred_mfe_bps": pred_mfe_bps,
+            "pred_mae_bps": pred_mae_bps,
+            "pred_rr": pred_rr,
+            "realized_vol_1h_bps": realized_vol_1h_bps,
+            "minutes_to_kronos_cutoff": minutes_to_kronos_cutoff,
+            "edge_z": edge_z,
+            "max_allowed_mae_bps": max_allowed_mae_bps,
+            "close_quality": close_quality,
+            "body_ratio": body_ratio,
+            "upper_wick_ratio": upper_wick_ratio,
+            "lower_wick_ratio": lower_wick_ratio,
+            "bad_wick_ratio": bad_wick_ratio,
+            "positive_metrics": positive_metrics,
+            "risk_metrics": risk_metrics,
+        }
+    )
+    return _json_safe_floats(payload)
+
+
+def _signal_pred_ohlcv(row: SignalRow | None) -> dict[str, float] | None:
+    if row is None or not row.metadata:
+        return None
+    raw = row.metadata.get("pred_ohlcv")
+    if not isinstance(raw, Mapping):
+        return None
+    pred = {col: _finite_float(raw.get(col), default=0.0) for col in ("open", "high", "low", "close")}
+    if any(value <= 0 for value in pred.values()):
+        return None
+    if pred["high"] < pred["low"]:
+        return None
+    return pred
+
+
+def _kronos_entry_market_prices(*, snapshot: Any, price: float, costs: Mapping[str, Any]) -> dict[str, float | str] | None:
+    bid = _finite_float(getattr(snapshot, "bid", 0.0), default=0.0) if snapshot is not None else 0.0
+    ask = _finite_float(getattr(snapshot, "ask", 0.0), default=0.0) if snapshot is not None else 0.0
+    if bid > 0 and ask > 0 and ask >= bid:
+        mid = (bid + ask) / 2.0
+        if mid > 0:
+            return {"bid": bid, "ask": ask, "mid": mid, "source": "snapshot_bid_ask"}
+
+    mid = _finite_float(getattr(snapshot, "last_price", 0.0), default=0.0) if snapshot is not None else 0.0
+    source = "last_price_plus_spread"
+    if mid <= 0:
+        mid = _finite_float(price, default=0.0)
+        source = "price_map_plus_spread"
+    if mid <= 0:
+        return None
+
+    spread_pct = _non_negative_float(costs.get("spread_pct"), default=0.0)
+    half_spread = min(spread_pct / 2.0, 0.99)
+    return {
+        "bid": mid * (1.0 - half_spread),
+        "ask": mid * (1.0 + half_spread),
+        "mid": mid,
+        "source": source,
+    }
+
+
+def _kronos_metrics_remaining_minutes(secid: str, session_filter_diagnostics: Mapping[str, Any] | None) -> float | None:
+    if not session_filter_diagnostics:
+        return None
+    by_secid = session_filter_diagnostics.get("by_secid")
+    if isinstance(by_secid, Mapping):
+        row = by_secid.get(secid)
+        if isinstance(row, Mapping):
+            recheck = row.get("entry_recheck_window")
+            if isinstance(recheck, Mapping):
+                value = _finite_float(recheck.get("remaining_minutes"), default=-1.0)
+                if value >= 0:
+                    return value
+    recheck = session_filter_diagnostics.get("entry_recheck_window")
+    if isinstance(recheck, Mapping):
+        value = _finite_float(recheck.get("remaining_minutes"), default=-1.0)
+        if value >= 0:
+            return value
+    return None
+
+
+def _metrics_config_float(config: TradeLifecycleEntryMetricsConfig, name: str, default: float) -> float:
+    return _finite_float(getattr(config, name, default), default=default)
+
+
+def _clip01(value: float) -> float:
+    return min(max(_finite_float(value, default=0.0), 0.0), 1.0)
+
+
+def _json_safe_floats(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _json_safe_floats(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_safe_floats(item) for item in value]
+    if isinstance(value, float):
+        return value if math.isfinite(value) else 0.0
+    return value
 
 
 def _tracker_side_for_lots(lots: int) -> str | None:

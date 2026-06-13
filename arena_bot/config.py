@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import os
 from pathlib import Path
 from typing import Any, Mapping
@@ -17,6 +18,7 @@ from .types import (
     RuntimeConfig,
     TradeLifecycleConfig,
     TradeLifecycleEntryConfig,
+    TradeLifecycleEntryMetricsConfig,
     TradeLifecycleExitConfig,
     TradingSessionConfig,
 )
@@ -216,10 +218,18 @@ def _parse_trade_lifecycle(raw: Mapping[str, Any] | None) -> TradeLifecycleConfi
     raw = dict(raw or {})
     exit_raw = raw.get("exit", {})
     entry_raw = raw.get("entry", {})
+    entry_payload = dict(entry_raw) if isinstance(entry_raw, Mapping) else {}
+    metrics_raw = entry_payload.pop("metrics", None)
+    entry_config = _dataclass_from_mapping(TradeLifecycleEntryConfig, entry_payload)
+    if isinstance(metrics_raw, Mapping):
+        entry_config = replace(
+            entry_config,
+            metrics=_dataclass_from_mapping(TradeLifecycleEntryMetricsConfig, metrics_raw),
+        )
     return TradeLifecycleConfig(
         max_total_positions=int(raw.get("max_total_positions", 5)),
         exit=_dataclass_from_mapping(TradeLifecycleExitConfig, exit_raw if isinstance(exit_raw, Mapping) else {}),
-        entry=_dataclass_from_mapping(TradeLifecycleEntryConfig, entry_raw if isinstance(entry_raw, Mapping) else {}),
+        entry=entry_config,
     )
 
 

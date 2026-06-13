@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Mapping, Protocol, Sequence
+from typing import Any, Mapping, Protocol, Sequence
 
 import numpy as np
 import pandas as pd
+import requests
 
 from .types import Instrument, MarketMetrics, MarketSnapshot
 
@@ -60,6 +62,264 @@ class StaticMarketDataProvider:
 
 class EmptyMarketDataProvider(StaticMarketDataProvider):
     pass
+
+
+class AlgoPackRealtimeMarketDataProvider:
+    def __init__(
+        self,
+        *,
+        fallback: MarketDataProvider,
+        token: str,
+        base_url: str = "https://apim.moex.com",
+        timeout: float = 10.0,
+        retries: int = 2,
+        session: requests.Session | None = None,
+    ):
+        self.fallback = fallback
+        self.token = str(token or "").strip()
+        self.base_url = str(base_url or "https://apim.moex.com").rstrip("/")
+        self.timeout = float(timeout)
+        self.retries = max(int(retries), 0)
+        self.session = session or requests.Session()
+        self._snapshot_cache_key: tuple[str, tuple[str, ...]] | None = None
+        self._snapshot_cache: dict[str, MarketSnapshot] = {}
+
+    def snapshots(self, as_of: datetime, instruments: Sequence[Instrument]) -> Mapping[str, MarketSnapshot]:
+        secids = tuple(instrument.secid for instrument in instruments)
+        key = (as_of.isoformat(timespec="seconds"), secids)
+        if self._snapshot_cache_key == key:
+            return dict(self._snapshot_cache)
+
+        fallback_rows = dict(self.fallback.snapshots(as_of, instruments))
+        out = dict(fallback_rows)
+        if not self.token:
+            self._snapshot_cache_key = key
+            self._snapshot_cache = out
+            return dict(out)
+
+        for instrument in instruments:
+            if instrument.asset_class not in {"equity", "future"}:
+                continue
+            snapshot = self._fetch_snapshot(instrument, fallback_rows.get(instrument.secid))
+            if snapshot is not None:
+                out[instrument.secid] = snapshot
+
+        self._snapshot_cache_key = key
+        self._snapshot_cache = out
+        return dict(out)
+
+    def candles(self, as_of: datetime, instruments: Sequence[Instrument]) -> Mapping[str, pd.DataFrame]:
+        return self.fallback.candles(as_of, instruments)
+
+    def metrics(self, as_of: datetime, instruments: Sequence[Instrument]) -> Mapping[str, MarketMetrics]:
+        snapshots = self.snapshots(as_of, instruments)
+        candles = self.candles(as_of, instruments)
+        return {
+            instrument.secid: compute_market_metrics(instrument.secid, candles.get(instrument.secid, pd.DataFrame()), snapshots.get(instrument.secid))
+            for instrument in instruments
+        }
+
+    @property
+    def _headers(self) -> dict[str, str]:
+        value = self.token if self.token.lower().startswith("bearer ") else f"Bearer {self.token}"
+        return {"Authorization": value}
+
+    def _fetch_snapshot(self, instrument: Instrument, fallback: MarketSnapshot | None) -> MarketSnapshot | None:
+        try:
+            orderbook = self._fetch_orderbook(instrument)
+        except Exception:
+            return fallback
+        try:
+            marketdata = self._fetch_marketdata(instrument)
+        except Exception:
+            marketdata = {}
+
+        bid, ask = _best_orderbook_bid_ask(orderbook)
+        source = "algopack_orderbook"
+        if bid <= 0 or ask <= 0 or ask < bid:
+            bid = _finite_row_float(marketdata, "BID")
+            ask = _finite_row_float(marketdata, "OFFER")
+            source = "algopack_marketdata"
+        if bid <= 0 or ask <= 0 or ask < bid:
+            return fallback
+
+        last_price = _finite_row_float(marketdata, "LAST")
+        if last_price <= 0 and fallback is not None:
+            last_price = float(fallback.last_price or 0.0)
+        if last_price <= 0:
+            last_price = (bid + ask) / 2.0
+
+        volume_value = _finite_row_float(marketdata, "VALTODAY")
+        if volume_value <= 0:
+            volume_value = _finite_row_float(marketdata, "VALUE")
+        if volume_value <= 0 and fallback is not None:
+            volume_value = float(fallback.volume_value or 0.0)
+
+        return MarketSnapshot(
+            secid=instrument.secid,
+            last_price=last_price,
+            bid=bid,
+            ask=ask,
+            volume_value=volume_value,
+            source=source,
+        )
+
+    def _fetch_marketdata(self, instrument: Instrument) -> Mapping[str, Any]:
+        rows = self._get_block(f"{self._security_url(instrument)}.json", block_name="marketdata", params={"iss.only": "marketdata"})
+        return rows[0] if rows else {}
+
+    def _fetch_orderbook(self, instrument: Instrument) -> list[Mapping[str, Any]]:
+        return self._get_block(f"{self._security_url(instrument)}/orderbook.json", block_name="orderbook", params={})
+
+    def _security_url(self, instrument: Instrument) -> str:
+        if instrument.asset_class == "future":
+            engine, market, board = "futures", "forts", instrument.boardid or "RFUD"
+        else:
+            engine, market, board = "stock", "shares", instrument.boardid or "TQBR"
+        return (
+            f"{self.base_url}/iss/engines/{engine}/markets/{market}/boards/"
+            f"{str(board).lower()}/securities/{instrument.secid.lower()}"
+        )
+
+    def _get_block(self, url: str, *, block_name: str, params: Mapping[str, Any]) -> list[dict[str, Any]]:
+        last_error: Exception | None = None
+        response = None
+        for attempt in range(self.retries + 1):
+            try:
+                response = self.session.get(url, params=dict(params), headers=self._headers, timeout=self.timeout)
+                response.raise_for_status()
+                break
+            except Exception as exc:
+                last_error = exc
+                response = None
+                if attempt < self.retries:
+                    time.sleep(0.25 * (attempt + 1))
+        if response is None:
+            if last_error is not None:
+                raise last_error
+            return []
+        payload = response.json()
+        block = payload.get(block_name) if isinstance(payload, Mapping) else None
+        if not isinstance(block, Mapping):
+            return []
+        columns = block.get("columns")
+        data = block.get("data")
+        if not isinstance(columns, list) or not isinstance(data, list):
+            return []
+        return [dict(zip(columns, row)) for row in data if isinstance(row, list)]
+
+
+class BinanceRealtimeMarketDataProvider:
+    def __init__(
+        self,
+        *,
+        fallback: MarketDataProvider,
+        base_url: str = "https://api.binance.com",
+        timeout: float = 10.0,
+        retries: int = 2,
+        session: requests.Session | None = None,
+    ):
+        self.fallback = fallback
+        self.base_url = str(base_url or "https://api.binance.com").rstrip("/")
+        self.timeout = float(timeout)
+        self.retries = max(int(retries), 0)
+        self.session = session or requests.Session()
+        self._snapshot_cache_key: tuple[str, tuple[str, ...]] | None = None
+        self._snapshot_cache: dict[str, MarketSnapshot] = {}
+
+    def snapshots(self, as_of: datetime, instruments: Sequence[Instrument]) -> Mapping[str, MarketSnapshot]:
+        secids = tuple(instrument.secid for instrument in instruments)
+        key = (as_of.isoformat(timespec="seconds"), secids)
+        if self._snapshot_cache_key == key:
+            return dict(self._snapshot_cache)
+
+        fallback_rows = dict(self.fallback.snapshots(as_of, instruments))
+        out = dict(fallback_rows)
+        for instrument in instruments:
+            if instrument.asset_class != "crypto":
+                continue
+            snapshot = self._fetch_snapshot(instrument, fallback_rows.get(instrument.secid))
+            if snapshot is not None:
+                out[instrument.secid] = snapshot
+
+        self._snapshot_cache_key = key
+        self._snapshot_cache = out
+        return dict(out)
+
+    def candles(self, as_of: datetime, instruments: Sequence[Instrument]) -> Mapping[str, pd.DataFrame]:
+        return self.fallback.candles(as_of, instruments)
+
+    def metrics(self, as_of: datetime, instruments: Sequence[Instrument]) -> Mapping[str, MarketMetrics]:
+        snapshots = self.snapshots(as_of, instruments)
+        candles = self.candles(as_of, instruments)
+        return {
+            instrument.secid: compute_market_metrics(instrument.secid, candles.get(instrument.secid, pd.DataFrame()), snapshots.get(instrument.secid))
+            for instrument in instruments
+        }
+
+    def _fetch_snapshot(self, instrument: Instrument, fallback: MarketSnapshot | None) -> MarketSnapshot | None:
+        try:
+            book = self._get_json(
+                f"{self.base_url}/api/v3/ticker/bookTicker",
+                params={"symbol": instrument.secid.upper()},
+            )
+        except Exception:
+            return fallback
+
+        bid = _finite_row_float(book, "bidPrice")
+        ask = _finite_row_float(book, "askPrice")
+        if bid <= 0 or ask <= 0 or ask < bid:
+            return fallback
+
+        last_price = _finite_row_float(book, "lastPrice")
+        volume_value = 0.0
+        if last_price <= 0 or volume_value <= 0:
+            try:
+                ticker = self._get_json(
+                    f"{self.base_url}/api/v3/ticker/24hr",
+                    params={"symbol": instrument.secid.upper()},
+                )
+            except Exception:
+                ticker = {}
+            if last_price <= 0:
+                last_price = _finite_row_float(ticker, "lastPrice")
+            volume_value = _finite_row_float(ticker, "quoteVolume")
+
+        if last_price <= 0 and fallback is not None:
+            last_price = float(fallback.last_price or 0.0)
+        if last_price <= 0:
+            last_price = (bid + ask) / 2.0
+        if volume_value <= 0 and fallback is not None:
+            volume_value = float(fallback.volume_value or 0.0)
+
+        return MarketSnapshot(
+            secid=instrument.secid,
+            last_price=last_price,
+            bid=bid,
+            ask=ask,
+            volume_value=volume_value,
+            source="binance_book_ticker",
+        )
+
+    def _get_json(self, url: str, *, params: Mapping[str, Any]) -> Mapping[str, Any]:
+        last_error: Exception | None = None
+        response = None
+        for attempt in range(self.retries + 1):
+            try:
+                response = self.session.get(url, params=dict(params), timeout=self.timeout)
+                response.raise_for_status()
+                break
+            except Exception as exc:
+                last_error = exc
+                response = None
+                if attempt < self.retries:
+                    time.sleep(0.25 * (attempt + 1))
+        if response is None:
+            if last_error is not None:
+                raise last_error
+            return {}
+        payload = response.json()
+        return payload if isinstance(payload, Mapping) else {}
 
 
 class SavedCandleMarketDataProvider:
@@ -243,6 +503,31 @@ def _volume_value(df: pd.DataFrame, snapshot: MarketSnapshot) -> float:
 
 def _finite(value: float, *, default: float = 0.0) -> float:
     return float(value) if math.isfinite(float(value)) else default
+
+
+def _finite_row_float(row: Mapping[str, Any], key: str) -> float:
+    try:
+        value = float(row.get(key, 0.0) or 0.0)
+    except Exception:
+        return 0.0
+    return value if math.isfinite(value) else 0.0
+
+
+def _best_orderbook_bid_ask(rows: Sequence[Mapping[str, Any]]) -> tuple[float, float]:
+    bids = []
+    asks = []
+    for row in rows:
+        price = _finite_row_float(row, "PRICE")
+        if price <= 0:
+            continue
+        side = str(row.get("BUYSELL", "")).strip().upper()
+        if side == "B":
+            bids.append(price)
+        elif side == "S":
+            asks.append(price)
+    bid = max(bids) if bids else 0.0
+    ask = min(asks) if asks else 0.0
+    return bid, ask
 
 
 def _saved_candle_bid_ask(close: float, instrument: Instrument) -> tuple[float, float]:

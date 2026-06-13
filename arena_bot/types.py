@@ -177,6 +177,17 @@ class TradeLifecycleExitConfig:
 
 
 @dataclass(frozen=True)
+class TradeLifecycleEntryMetricsConfig:
+    enabled: bool = True
+    min_edge_bps: float = 10.0
+    edge_scale_bps: float = 70.0
+    vol_floor_bps: float = 10.0
+    max_allowed_spread_bps: float = 20.0
+    required_recheck_minutes: float = 120.0
+    eps: float = 1e-12
+
+
+@dataclass(frozen=True)
 class TradeLifecycleEntryConfig:
     mode: str = "selectors"
     include_held_for_topup: bool = True
@@ -188,6 +199,7 @@ class TradeLifecycleEntryConfig:
     single_top_min_rank_gap: float = 0.0
     single_top_max_gross_pred_return: float = 0.0075
     single_top_target_weight: float = 1.0
+    metrics: TradeLifecycleEntryMetricsConfig = field(default_factory=TradeLifecycleEntryMetricsConfig)
 
 
 @dataclass(frozen=True)
