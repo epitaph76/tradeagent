@@ -19,6 +19,7 @@ from .market_data import EmptyMarketDataProvider, MarketDataProvider, build_mark
 from .meta_selector import LightGBMMetaSelector, RollingRankWeightedMetaSelector
 from .order_manager import OrderManager
 from .portfolio import blend_selector_portfolios, prune_blended_weights
+from .ranking.scoring import compute_candidate_vectors, instrument_scales_from_history, load_instrument_weights, score_candidate
 from .selectors import build_selector_portfolio
 from .signals import EmptyKronosSignalProvider, MomentumSignalProvider, SignalProvider, latest_signal_scores, with_equity_kronos_fallback
 from .storage import StateStore
@@ -51,6 +52,7 @@ class RuntimeEngine:
         self.exit_kronos_provider = exit_kronos_provider or self._build_exit_kronos_provider()
         self.momentum_provider = momentum_provider or MomentumSignalProvider()
         self.instruments_by_secid: dict[str, Instrument] = {instrument.secid: instrument for instrument in config.instruments}
+        self._vector_research_instrument_weights: dict[str, dict[str, Any]] | None = None
         self.lightgbm = LightGBMMetaSelector(
             model_dir=_model_dir(config),
             base_selectors=[selector.name for selector in config.base_selectors],
@@ -244,7 +246,44 @@ class RuntimeEngine:
         else:
             self._update_selector_returns(as_of_s, {secid: row.last_price for secid, row in snapshots.items()})
             entry_mode = _entry_mode(self.config)
-            if entry_mode == "kronos_rank":
+            if entry_mode == "kronos_vector_research":
+                kronos_rows = tuple(self.kronos_provider.score(as_of, selected, candles))
+                signals = tuple(row for row in kronos_rows if row.signal_name == "kronos")
+                signal_scores = latest_signal_scores(signals, "kronos")
+                features = build_market_features(
+                    selected_secids=tuple(instrument.secid for instrument in selected),
+                    snapshots=snapshots,
+                    metrics=metrics,
+                    signal_scores=signal_scores,
+                )
+                self.state.save_market_features(as_of_s, features)
+                selector_weights = {"kronos_vector_research": 1.0}
+                meta_payload = {
+                    "mode": "bypassed_kronos_vector_research",
+                    "reason": "trade_lifecycle.entry.mode=kronos_vector_research",
+                    "features": features,
+                }
+                selector_diagnostics = {}
+                target_weights, entry_diagnostics = self._build_kronos_vector_research_entry_targets(
+                    instruments=selected,
+                    positions=positions_after_risk,
+                    account=account_after_risk,
+                    prices=prices,
+                    snapshots=snapshots,
+                    metrics=metrics,
+                    candles=candles,
+                    signals=signals,
+                    blocked_secids=exit_close_secids,
+                )
+                blend_diagnostics = {
+                    "mode": "bypassed_kronos_vector_research",
+                    "ranking_mode": "kronos_vector_research",
+                    "final_target_positions_count": len([weight for weight in target_weights.values() if abs(float(weight)) > 1e-12]),
+                    "ranked_candidates_count": len(entry_diagnostics.get("ranked_candidates", [])),
+                    "selected_count": int(entry_diagnostics.get("selected_count", 0) or 0),
+                }
+                self.logger.write("selector_model_ready", {"as_of": as_of_s, **meta_payload})
+            elif entry_mode == "kronos_rank":
                 kronos_rows = tuple(self.kronos_provider.score(as_of, selected, candles))
                 signals = tuple(row for row in kronos_rows if row.signal_name == "kronos")
                 signal_scores = latest_signal_scores(signals, "kronos")
@@ -1828,6 +1867,276 @@ class RuntimeEngine:
             "selected_count": len(selected),
             "selected_new_entries": used_new_slots,
             "selected_topups": len(selected) - used_new_slots,
+            "ranked_candidates": candidates,
+        }
+
+    def _vector_research_weights(self) -> dict[str, dict[str, Any]]:
+        if self._vector_research_instrument_weights is None:
+            entry = self.config.trade_lifecycle.entry
+            self._vector_research_instrument_weights = load_instrument_weights(
+                path=str(getattr(entry, "instrument_weights_path", "") or "") or None,
+                inline=getattr(entry, "instrument_weights", {}) or None,
+                instruments=self.config.instruments,
+            )
+        return self._vector_research_instrument_weights
+
+    def _build_kronos_vector_research_entry_targets(
+        self,
+        *,
+        instruments: tuple[Instrument, ...],
+        positions: Mapping[str, int],
+        account: AccountState,
+        prices: Mapping[str, float],
+        snapshots: Mapping[str, Any],
+        metrics: Mapping[str, Any],
+        candles: Mapping[str, Any],
+        signals: tuple[SignalRow, ...],
+        blocked_secids: set[str],
+    ) -> tuple[dict[str, float], dict[str, Any]]:
+        lifecycle = self.config.trade_lifecycle
+        equity = max(float(account.equity), 1.0)
+        current_weights = _position_weights(positions, prices, self.instruments_by_secid, equity)
+        gross_after_exit = float(account.gross)
+        free_value = _entry_free_value(account, self.config.risk)
+        free_weight = free_value / equity if equity > 0 else 0.0
+        held_count = sum(1 for lots in positions.values() if int(lots or 0) != 0)
+        free_slots = max(int(lifecycle.max_total_positions) - held_count, 0)
+        rows_by_secid = {row.secid: row for row in signals if row.signal_name == "kronos"}
+        instrument_weights = self._vector_research_weights()
+
+        scored: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        for instrument in instruments:
+            secid = instrument.secid
+            signal_row = rows_by_secid.get(secid)
+            pred_return = _signal_pred_return(signal_row)
+            pred = _signal_pred_ohlcv(signal_row)
+            current_lots = int(positions.get(secid, 0) or 0)
+            held = current_lots != 0
+            if pred is None:
+                for side in ("long", "short"):
+                    skipped.append(
+                        {
+                            "rank": None,
+                            "secid": secid,
+                            "asset_class": instrument.asset_class,
+                            "pred_return": pred_return,
+                            "side": side,
+                            "direction": side,
+                            "held": held,
+                            "selected": False,
+                            "reason": "missing_pred_ohlcv",
+                            "allocated_weight": 0.0,
+                        }
+                    )
+                continue
+
+            costs = _trade_cost_breakdown(secid, snapshots, metrics, self.config.risk)
+            market = _kronos_entry_market_prices(
+                snapshot=snapshots.get(secid),
+                price=float(prices.get(secid, 0.0) or 0.0),
+                costs=costs,
+            )
+            if market is None:
+                for side in ("long", "short"):
+                    skipped.append(
+                        {
+                            "rank": None,
+                            "secid": secid,
+                            "asset_class": instrument.asset_class,
+                            "pred_return": pred_return,
+                            "side": side,
+                            "direction": side,
+                            "held": held,
+                            "selected": False,
+                            "reason": "missing_market_price",
+                            "allocated_weight": 0.0,
+                            **costs,
+                        }
+                    )
+                continue
+
+            scales = instrument_scales_from_history(
+                candles.get(secid),
+                snapshot=snapshots.get(secid),
+                metric=metrics.get(secid),
+            )
+            weights = instrument_weights.get(secid) or instrument_weights.get(str(secid))
+            if weights is None:
+                weights = load_instrument_weights(instruments=(instrument,))[secid]
+
+            for side in ("long", "short"):
+                candidate = {
+                    "secid": secid,
+                    "direction": side,
+                    "side": side,
+                    "bid": float(market["bid"]),
+                    "ask": float(market["ask"]),
+                    "pred_open": pred["open"],
+                    "pred_high": pred["high"],
+                    "pred_low": pred["low"],
+                    "pred_close": pred["close"],
+                    "commission_rate": float(costs["commission_rate"]),
+                    "slippage_rate": float(costs["slippage_one_way"]),
+                }
+                try:
+                    vector_payload = compute_candidate_vectors(candidate, scales)
+                    score_payload = score_candidate(vector_payload, weights)
+                except Exception as exc:
+                    skipped.append(
+                        {
+                            "rank": None,
+                            "secid": secid,
+                            "asset_class": instrument.asset_class,
+                            "pred_return": pred_return,
+                            "side": side,
+                            "direction": side,
+                            "held": held,
+                            "selected": False,
+                            "reason": f"vector_metrics_error: {str(exc)[:160]}",
+                            "allocated_weight": 0.0,
+                            **costs,
+                        }
+                    )
+                    continue
+
+                raw_metrics = dict(vector_payload["raw_metrics"])
+                risk_threshold = float(weights["risk_threshold"])
+                item = {
+                    "rank": None,
+                    "secid": secid,
+                    "asset_class": instrument.asset_class,
+                    "pred_return": pred_return,
+                    "edge": raw_metrics.get("net_edge"),
+                    "gross_pred_return": abs(float(raw_metrics.get("gross_edge", 0.0) or 0.0)),
+                    "net_edge": raw_metrics.get("net_edge"),
+                    "side": side,
+                    "direction": side,
+                    "held": held,
+                    "selected": False,
+                    "reason": "",
+                    "allocated_weight": 0.0,
+                    "positive_vector": vector_payload["positive_vector"],
+                    "risk_vector": vector_payload["risk_vector"],
+                    "positive_metrics": vector_payload["positive_vector"],
+                    "risk_metrics": vector_payload["risk_vector"],
+                    "positive_score": score_payload["positive_score"],
+                    "risk_score": score_payload["risk_score"],
+                    "risk_threshold": risk_threshold,
+                    "instrument_scales": vector_payload["instrument_scales"],
+                    "raw_vector_metrics": raw_metrics,
+                    "current_bid": float(market["bid"]),
+                    "current_ask": float(market["ask"]),
+                    "current_mid": float(market["mid"]),
+                    "market_price_source": market["source"],
+                    "pred_open": pred["open"],
+                    "pred_high": pred["high"],
+                    "pred_low": pred["low"],
+                    "pred_close": pred["close"],
+                    **costs,
+                }
+                if float(item["risk_score"]) > risk_threshold:
+                    item["reason"] = "risk_score_above_threshold"
+                scored.append(item)
+
+        allowed = [item for item in scored if str(item.get("reason") or "") != "risk_score_above_threshold"]
+        blocked_by_risk = [item for item in scored if str(item.get("reason") or "") == "risk_score_above_threshold"]
+        allowed.sort(key=lambda item: (-float(item["positive_score"]), str(item["secid"]), str(item["side"])))
+        for rank, item in enumerate(allowed, start=1):
+            item["rank"] = rank
+
+        selection_pool: list[dict[str, Any]] = []
+        seen_secids: set[str] = set()
+        for item in allowed:
+            secid = str(item["secid"])
+            if secid in seen_secids:
+                item["reason"] = "same_secid_lower_score"
+                continue
+            seen_secids.add(secid)
+            selection_pool.append(item)
+
+        selected: list[dict[str, Any]] = []
+        used_new_slots = 0
+        blocked_by_orderability: dict[str, str] = {}
+        rank_power = float(lifecycle.entry.rank_power)
+        target_weights = dict(current_weights)
+        for _ in range(len(selection_pool) + 1):
+            selected = []
+            used_new_slots = 0
+            for item in selection_pool:
+                item["selected"] = False
+                item["allocated_weight"] = 0.0
+                item.pop("target_weight", None)
+                item["reason"] = ""
+            for item in selection_pool:
+                self._mark_kronos_rank_candidate_selection(
+                    item=item,
+                    positions=positions,
+                    blocked_secids=blocked_secids,
+                    blocked_by_orderability=blocked_by_orderability,
+                    selected=selected,
+                    used_new_slots_ref={"value": used_new_slots},
+                    free_slots=free_slots,
+                    free_weight=free_weight,
+                )
+                used_new_slots = sum(1 for row in selected if row["reason"] == "new_entry")
+
+            target_weights = dict(current_weights)
+            if selected and free_weight > 0:
+                for item, allocation in zip(selected, _rank_budget_weights(len(selected), rank_power)):
+                    secid = str(item["secid"])
+                    side = 1.0 if item["side"] == "long" else -1.0
+                    add_weight = free_weight * allocation
+                    target_weights[secid] = float(target_weights.get(secid, 0.0) or 0.0) + side * add_weight
+                    item["allocated_weight"] = add_weight
+                    item["target_weight"] = target_weights[secid]
+
+            blocked_now = None
+            for item in selected:
+                reason = _incremental_entry_block_reason(
+                    secid=str(item["secid"]),
+                    target_weight=float(item.get("target_weight", 0.0) or 0.0),
+                    positions=positions,
+                    prices=prices,
+                    instruments=self.instruments_by_secid,
+                    equity=equity,
+                    min_order_value=float(self.config.risk.min_order_value_rub),
+                    min_position_change_weight=float(self.config.risk.min_position_change_weight),
+                )
+                if reason:
+                    blocked_now = (str(item["secid"]), reason)
+                    break
+            if blocked_now is None:
+                break
+            blocked_by_orderability[blocked_now[0]] = blocked_now[1]
+        else:
+            target_weights = dict(current_weights)
+
+        blocked_by_risk.sort(key=lambda item: (str(item["secid"]), str(item["side"])))
+        skipped.sort(key=lambda item: (str(item["secid"]), str(item["side"])))
+        candidates = allowed + blocked_by_risk + skipped
+        return target_weights, {
+            "ranking_mode": "kronos_vector_research",
+            "ranking_metric": "positive_cosine_strength",
+            "risk_metric": "weighted_sum",
+            "ideal_positive": [1.0] * 9,
+            "ideal_risk": [0.0] * 5,
+            "capital_mode": lifecycle.entry.capital_mode,
+            "topup_sizing": lifecycle.entry.topup_sizing,
+            "rank_power": rank_power,
+            "max_total_positions": int(lifecycle.max_total_positions),
+            "held_count": held_count,
+            "free_slots": free_slots,
+            "gross_after_exit": gross_after_exit,
+            "margin_used_after_exit": float(account.margin_used),
+            "free_capital": free_value,
+            "free_weight": free_weight,
+            "selected_count": len(selected),
+            "selected_new_entries": used_new_slots,
+            "selected_topups": len(selected) - used_new_slots,
+            "candidate_count": len(candidates),
+            "allowed_count": len(allowed),
+            "risk_blocked_count": len(blocked_by_risk),
             "ranked_candidates": candidates,
         }
 

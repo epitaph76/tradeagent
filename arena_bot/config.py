@@ -146,7 +146,7 @@ def load_config(path: str | Path) -> RuntimeConfig:
         kronos=_dataclass_from_mapping(KronosConfig, raw.get("kronos", {})),
         max_equities=int(raw.get("universe", {}).get("max_equities", raw.get("max_equities", 10))),
         trading_session=_dataclass_from_mapping(TradingSessionConfig, raw.get("trading_session", {})),
-        trade_lifecycle=_parse_trade_lifecycle(raw.get("trade_lifecycle", {})),
+        trade_lifecycle=_parse_trade_lifecycle(raw.get("trade_lifecycle", {}), base_dir=path.parent),
     )
 
 
@@ -214,12 +214,17 @@ def _dataclass_from_mapping(cls, raw: Mapping[str, Any] | None):
     return cls(**{k: v for k, v in raw.items() if k in allowed})
 
 
-def _parse_trade_lifecycle(raw: Mapping[str, Any] | None) -> TradeLifecycleConfig:
+def _parse_trade_lifecycle(raw: Mapping[str, Any] | None, *, base_dir: Path | None = None) -> TradeLifecycleConfig:
     raw = dict(raw or {})
     exit_raw = raw.get("exit", {})
     entry_raw = raw.get("entry", {})
     entry_payload = dict(entry_raw) if isinstance(entry_raw, Mapping) else {}
     metrics_raw = entry_payload.pop("metrics", None)
+    weights_path = str(entry_payload.get("instrument_weights_path") or "")
+    if weights_path and base_dir is not None:
+        parsed_path = Path(weights_path)
+        if not parsed_path.is_absolute():
+            entry_payload["instrument_weights_path"] = str((base_dir / parsed_path).resolve())
     entry_config = _dataclass_from_mapping(TradeLifecycleEntryConfig, entry_payload)
     if isinstance(metrics_raw, Mapping):
         entry_config = replace(

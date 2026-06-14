@@ -10,6 +10,7 @@ import pytest
 
 from arena_bot.logging import JsonlLogger
 from arena_bot.market_data import StaticMarketDataProvider
+from arena_bot.ranking.scoring import BASELINE_POSITIVE_WEIGHTS, BASELINE_RISK_WEIGHTS
 from arena_bot.runtime import RuntimeEngine, _kronos_entry_metrics_payload, _trading_session_state
 from arena_bot.signals import StaticSignalProvider
 from arena_bot.storage import StateStore
@@ -870,6 +871,81 @@ def test_kronos_rank_attaches_entry_metrics(tmp_path: Path):
     assert payload["entry_diagnostics"]["ranking_mode"] == "kronos_rank"
 
 
+def test_kronos_vector_research_builds_long_short_candidates_and_selects_best_direction(tmp_path: Path):
+    provider = ForecastSignalProvider(
+        {"SBER": 0.03},
+        pred_ohlcv={"SBER": {"open": 100.0, "high": 104.0, "low": 99.5, "close": 103.0}},
+    )
+    engine = _engine(
+        tmp_path,
+        mode="paper",
+        scores={},
+        instruments=(Instrument("SBER"),),
+        entry_mode="kronos_vector_research",
+        portfolio_max_positions=5,
+        kronos_provider=provider,
+        entry_instrument_weights={
+            "SBER": {
+                "positive_weights": BASELINE_POSITIVE_WEIGHTS,
+                "risk_weights": BASELINE_RISK_WEIGHTS,
+                "risk_threshold": 1.0,
+            }
+        },
+    )
+
+    result = engine.run_once(datetime(2026, 6, 3, 12, 0))
+    payload = _decision_payload(engine, result.decision_id)
+    rows = [row for row in payload["entry_ranked_candidates"] if row["secid"] == "SBER"]
+    selected = [row for row in rows if row["selected"]]
+
+    assert payload["entry_diagnostics"]["ranking_mode"] == "kronos_vector_research"
+    assert {row["side"] for row in rows} == {"long", "short"}
+    assert all("positive_vector" in row and "risk_vector" in row for row in rows)
+    assert all("positive_score" in row and "risk_score" in row for row in rows)
+    assert len(selected) == 1
+    assert selected[0]["side"] == "long"
+    assert any(order.secid == "SBER" and order.direction == "B" for order in result.orders)
+
+
+def test_kronos_vector_research_filters_by_per_instrument_risk_threshold(tmp_path: Path):
+    provider = ForecastSignalProvider(
+        {"SBER": 0.03},
+        pred_ohlcv={"SBER": {"open": 100.0, "high": 104.0, "low": 99.5, "close": 103.0}},
+    )
+    risk_weights = {
+        "false_breakout_risk": 0.0,
+        "wide_spread_risk": 0.0,
+        "late_entry_risk": 0.0,
+        "high_mae_risk": 0.0,
+        "direction_conflict_risk": 1.0,
+    }
+    engine = _engine(
+        tmp_path,
+        mode="paper",
+        scores={},
+        instruments=(Instrument("SBER"),),
+        entry_mode="kronos_vector_research",
+        portfolio_max_positions=5,
+        kronos_provider=provider,
+        entry_instrument_weights={
+            "SBER": {
+                "positive_weights": BASELINE_POSITIVE_WEIGHTS,
+                "risk_weights": risk_weights,
+                "risk_threshold": 0.5,
+            }
+        },
+    )
+
+    result = engine.run_once(datetime(2026, 6, 3, 12, 0))
+    payload = _decision_payload(engine, result.decision_id)
+    by_side = {row["side"]: row for row in payload["entry_ranked_candidates"] if row["secid"] == "SBER"}
+
+    assert by_side["short"]["reason"] == "risk_score_above_threshold"
+    assert by_side["short"]["risk_score"] > by_side["short"]["risk_threshold"]
+    assert by_side["long"]["selected"] is True
+    assert result.orders
+
+
 def test_kronos_rank_sorts_by_abs_edge_not_bullish_score(tmp_path: Path):
     instruments = (Instrument("SMALL_LONG"), Instrument("BIG_SHORT"), Instrument("MID_LONG"))
     engine = _engine(
@@ -1692,6 +1768,7 @@ def _engine(
     single_top_min_rank_gap: float = 0.0,
     single_top_max_gross_pred_return: float = 0.0075,
     single_top_target_weight: float = 1.0,
+    entry_instrument_weights: dict | None = None,
     candles_by_secid: dict[str, pd.DataFrame] | None = None,
     trading_session: TradingSessionConfig | None = None,
     kronos_provider=None,
@@ -1744,6 +1821,7 @@ def _engine(
                 single_top_min_rank_gap=single_top_min_rank_gap,
                 single_top_max_gross_pred_return=single_top_max_gross_pred_return,
                 single_top_target_weight=single_top_target_weight,
+                instrument_weights=entry_instrument_weights or {},
             ),
         ),
     )

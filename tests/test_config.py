@@ -31,3 +31,23 @@ trade_lifecycle:
     assert config.trade_lifecycle.entry.metrics.max_allowed_spread_bps == 25
     assert config.trade_lifecycle.entry.metrics.required_recheck_minutes == 90
     assert config.trade_lifecycle.entry.metrics.eps == 0.000001
+
+
+def test_entry_instrument_weights_path_is_resolved_relative_to_config(tmp_path):
+    path = tmp_path / "configs" / "config.yaml"
+    path.parent.mkdir()
+    path.write_text(
+        """
+mode: paper
+trade_lifecycle:
+  entry:
+    mode: kronos_vector_research
+    instrument_weights_path: baseline_per_instrument_weights.yaml
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config.trade_lifecycle.entry.mode == "kronos_vector_research"
+    assert config.trade_lifecycle.entry.instrument_weights_path == str(path.parent / "baseline_per_instrument_weights.yaml")

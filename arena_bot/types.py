@@ -199,6 +199,8 @@ class TradeLifecycleEntryConfig:
     single_top_min_rank_gap: float = 0.0
     single_top_max_gross_pred_return: float = 0.0075
     single_top_target_weight: float = 1.0
+    instrument_weights_path: str = ""
+    instrument_weights: Mapping[str, Any] = field(default_factory=dict)
     metrics: TradeLifecycleEntryMetricsConfig = field(default_factory=TradeLifecycleEntryMetricsConfig)
 
 
