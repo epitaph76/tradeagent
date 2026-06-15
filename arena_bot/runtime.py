@@ -2002,6 +2002,7 @@ class RuntimeEngine:
 
                 raw_metrics = dict(vector_payload["raw_metrics"])
                 risk_threshold = float(weights["risk_threshold"])
+                positive_threshold = float(weights.get("positive_threshold", 0.0))
                 item = {
                     "rank": None,
                     "secid": secid,
@@ -2023,6 +2024,7 @@ class RuntimeEngine:
                     "positive_score": score_payload["positive_score"],
                     "risk_score": score_payload["risk_score"],
                     "risk_threshold": risk_threshold,
+                    "positive_threshold": positive_threshold,
                     "instrument_scales": vector_payload["instrument_scales"],
                     "raw_vector_metrics": raw_metrics,
                     "current_bid": float(market["bid"]),
@@ -2035,11 +2037,14 @@ class RuntimeEngine:
                     "pred_close": pred["close"],
                     **costs,
                 }
-                if float(item["risk_score"]) > risk_threshold:
+                if float(item["positive_score"]) < positive_threshold:
+                    item["reason"] = "positive_score_below_threshold"
+                elif float(item["risk_score"]) > risk_threshold:
                     item["reason"] = "risk_score_above_threshold"
                 scored.append(item)
 
-        allowed = [item for item in scored if str(item.get("reason") or "") != "risk_score_above_threshold"]
+        allowed = [item for item in scored if not str(item.get("reason") or "")]
+        blocked_by_positive = [item for item in scored if str(item.get("reason") or "") == "positive_score_below_threshold"]
         blocked_by_risk = [item for item in scored if str(item.get("reason") or "") == "risk_score_above_threshold"]
         allowed.sort(key=lambda item: (-float(item["positive_score"]), str(item["secid"]), str(item["side"])))
         for rank, item in enumerate(allowed, start=1):
@@ -2113,8 +2118,15 @@ class RuntimeEngine:
             target_weights = dict(current_weights)
 
         blocked_by_risk.sort(key=lambda item: (str(item["secid"]), str(item["side"])))
+        blocked_by_positive.sort(key=lambda item: (-float(item["positive_score"]), str(item["secid"]), str(item["side"])))
         skipped.sort(key=lambda item: (str(item["secid"]), str(item["side"])))
-        candidates = allowed + blocked_by_risk + skipped
+        candidates = allowed + blocked_by_positive + blocked_by_risk + skipped
+        positive_thresholds = sorted({float(item.get("positive_threshold", 0.0) or 0.0) for item in scored})
+        positive_threshold_diag: float | list[float] = 0.0
+        if len(positive_thresholds) == 1:
+            positive_threshold_diag = positive_thresholds[0]
+        elif positive_thresholds:
+            positive_threshold_diag = positive_thresholds
         return target_weights, {
             "ranking_mode": "kronos_vector_research",
             "ranking_metric": "positive_cosine_strength",
@@ -2136,6 +2148,8 @@ class RuntimeEngine:
             "selected_topups": len(selected) - used_new_slots,
             "candidate_count": len(candidates),
             "allowed_count": len(allowed),
+            "positive_threshold": positive_threshold_diag,
+            "positive_blocked_count": len(blocked_by_positive),
             "risk_blocked_count": len(blocked_by_risk),
             "ranked_candidates": candidates,
         }

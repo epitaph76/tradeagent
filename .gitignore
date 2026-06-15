@@ -20,6 +20,8 @@ logs/
 tmp*/
 data/**/logs/
 data/**/runtime-runs/
+data/**/optimized/
+data/analysis/
 data/**/static-smoke/
 data/**/arena_state.sqlite3
 data/**/*.sqlite

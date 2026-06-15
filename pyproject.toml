@@ -13,7 +13,6 @@ dependencies = [
   "huggingface_hub>=0.33",
   "lightgbm>=4.0",
   "numpy>=2.0",
-  "optuna>=4.0",
   "pandas>=2.2",
   "pyyaml>=6.0",
   "requests>=2.31",
@@ -24,6 +23,7 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=8.0"]
+optimize = ["optuna>=3.6"]
 
 [project.scripts]
 arena-bot = "arena_bot.cli:main"
@@ -31,6 +31,7 @@ run-live = "arena_bot.cli:run_live_main"
 run-once = "arena_bot.cli:run_once_main"
 train-lightgbm = "arena_bot.cli:train_lightgbm_main"
 diagnose = "arena_bot.cli:diagnose_main"
+optimize-positive-weights = "arena_bot.optimization.positive_weights:main"
 
 [tool.setuptools.packages.find]
 include = ["arena_bot*"]

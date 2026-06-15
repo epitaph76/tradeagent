@@ -50,6 +50,7 @@ BASELINE_RISK_WEIGHTS = {
 }
 
 BASELINE_RISK_THRESHOLD = 0.35
+BASELINE_POSITIVE_THRESHOLD = 0.0
 
 DEFAULT_INSTRUMENT_SCALES = {
     "edge_good_pct": 0.006,
@@ -343,6 +344,7 @@ def baseline_instrument_weights(secids: Sequence[str]) -> dict[str, dict[str, An
             "positive_weights": dict(BASELINE_POSITIVE_WEIGHTS),
             "risk_weights": dict(BASELINE_RISK_WEIGHTS),
             "risk_threshold": BASELINE_RISK_THRESHOLD,
+            "positive_threshold": BASELINE_POSITIVE_THRESHOLD,
         }
         for secid in secids
     }
@@ -378,16 +380,24 @@ def _normalize_instrument_weight_row(raw: Any, *, secid: str) -> dict[str, Any]:
             "positive_weights": dict(BASELINE_POSITIVE_WEIGHTS),
             "risk_weights": dict(BASELINE_RISK_WEIGHTS),
             "risk_threshold": BASELINE_RISK_THRESHOLD,
+            "positive_threshold": BASELINE_POSITIVE_THRESHOLD,
         }
     if not isinstance(raw, Mapping):
         raise ValueError(f"instrument weights for {secid} must be a mapping")
     threshold = _finite_float(raw.get("risk_threshold", BASELINE_RISK_THRESHOLD), default=BASELINE_RISK_THRESHOLD)
     if threshold < 0.0 or threshold > 1.0:
         raise ValueError(f"risk_threshold for {secid} must be in [0, 1]")
+    positive_threshold = _finite_float(
+        raw.get("positive_threshold", BASELINE_POSITIVE_THRESHOLD),
+        default=BASELINE_POSITIVE_THRESHOLD,
+    )
+    if positive_threshold < 0.0 or positive_threshold > 1.0:
+        raise ValueError(f"positive_threshold for {secid} must be in [0, 1]")
     out = {
         "positive_weights": validate_metric_weights(raw.get("positive_weights", {}), POSITIVE_METRICS),
         "risk_weights": validate_metric_weights(raw.get("risk_weights", {}), RISK_METRICS),
         "risk_threshold": threshold,
+        "positive_threshold": positive_threshold,
     }
     if "objective_value" in raw:
         out["objective_value"] = _finite_float(raw.get("objective_value"), default=0.0)

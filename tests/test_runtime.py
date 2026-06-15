@@ -946,6 +946,44 @@ def test_kronos_vector_research_filters_by_per_instrument_risk_threshold(tmp_pat
     assert result.orders
 
 
+def test_kronos_vector_research_filters_by_positive_threshold(tmp_path: Path):
+    provider = ForecastSignalProvider(
+        {"SBER": 0.001},
+        pred_ohlcv={"SBER": {"open": 100.0, "high": 100.2, "low": 99.8, "close": 100.1}},
+    )
+    engine = _engine(
+        tmp_path,
+        mode="paper",
+        scores={},
+        instruments=(Instrument("SBER"),),
+        entry_mode="kronos_vector_research",
+        portfolio_max_positions=5,
+        kronos_provider=provider,
+        entry_instrument_weights={
+            "SBER": {
+                "positive_weights": BASELINE_POSITIVE_WEIGHTS,
+                "positive_threshold": 0.8,
+                "risk_weights": BASELINE_RISK_WEIGHTS,
+                "risk_threshold": 1.0,
+            }
+        },
+    )
+
+    result = engine.run_once(datetime(2026, 6, 3, 12, 0))
+    payload = _decision_payload(engine, result.decision_id)
+    rows = [row for row in payload["entry_ranked_candidates"] if row["secid"] == "SBER"]
+
+    assert not result.orders
+    assert rows
+    assert all(row["reason"] == "positive_score_below_threshold" for row in rows)
+    assert all(row["rank"] is None for row in rows)
+    assert all(row["selected"] is False for row in rows)
+    assert all(row["positive_score"] < row["positive_threshold"] for row in rows)
+    assert payload["entry_diagnostics"]["positive_threshold"] == pytest.approx(0.8)
+    assert payload["entry_diagnostics"]["positive_blocked_count"] == len(rows)
+    assert payload["entry_diagnostics"]["allowed_count"] == 0
+
+
 def test_kronos_rank_sorts_by_abs_edge_not_bullish_score(tmp_path: Path):
     instruments = (Instrument("SMALL_LONG"), Instrument("BIG_SHORT"), Instrument("MID_LONG"))
     engine = _engine(
